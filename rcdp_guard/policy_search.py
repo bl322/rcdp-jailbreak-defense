@@ -16,7 +16,20 @@ Two procedures live here.
     rcdp_guard.multiturn.split_by_cluster); nothing here sees evaluation data.
     The candidate is evaluated with use_trajectory_features=False, i.e. the
     routing risk is min(1, r_t + eta*rho_{t-1} + xi*max(0, r_t - r_{t-1}))
-    and rho_t = lambda*rho_{t-1} + max(0, r_t - tau_c), the paper's equations.
+    and rho_t = lambda*rho_{t-1} + max(0, r_t - tau_c), the paper's equations,
+    on the base variant's downgrade rule (4-state+memory: one level at a time
+    after k_down safe turns).
+    What the paper fixes and what it does not: Sec. 4 (4_method.tex) names the
+    eight components of vartheta, "a finite candidate set", "calibration
+    trajectories" and a fixed scorer/Platt layer, and defers "full details" to
+    the supplementary material, which contains none (no objective, no candidate
+    values, no split). The objective above is therefore the paper's only stated
+    operating-point criterion (J with alpha = 1.0) applied at session level; the
+    candidate values (POLICY_SPACE_R1) are the submitted grid's values mapped to
+    vartheta, plus lambda = 0.80 (paper default) and eta = 0 / xi = 0 (term off).
+    k_down and k_up only move non-blocking states (downgrades; N->C and C->H
+    escalation), so they change tokens but never session ABR/BAR; they are
+    decided by the token tie-break.
 
 ``search_trajectory_policy`` / ``replay_summary`` / ``split_examples_by_id``
 (legacy, unchanged): the submitted procedure. It differs from the paper in
@@ -89,6 +102,7 @@ def replay_session(
     latched = False
     prev_p = 0.0
     has_prev = False
+    downgrade_run = 0
     total = len(probs) or 1
     traj = config.use_trajectory_features
     decay_counters = config.allow_state_downgrade and config.history_decay > 0
@@ -102,6 +116,7 @@ def replay_session(
         trend = p - ref
         eff = p
         pressure = max(0.0, p - tau_c)
+        safe_run = downgrade_run + 1 if p < tau_c else 0
         if config.use_risk_memory:
             eff = min(1.0, p + config.risk_memory_gain * risk_memory)
         if config.risk_trend_gain:
@@ -127,9 +142,11 @@ def replay_session(
             prev_risk_level=prev_p if (has_prev or config.legacy_first_turn_trend) else eff,
             transition_score=0.5,
             thresholds=thresholds,
+            safe_run=safe_run,
         )
         if config.use_hazard_latch and latched:
             state = _Q
+        downgrade_run = 0 if (prior_state is not None and _rank(state) < _rank(prior_state)) else safe_run
         decision = "block" if state == _Q else "allow"
         out.append((state, decision, eff, risk_memory))
         if decision == "block" and stop_at_block:

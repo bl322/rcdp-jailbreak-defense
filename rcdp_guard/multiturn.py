@@ -17,16 +17,25 @@ Protocol
    turn is allowed. The controller's only blocking action is Quarantine; it has
    no separate "non-recoverable refusal" action (Hardened is
    allow-with-output-check, whose output check is not part of the
-   controller-level metric). Quarantine is terminal: turns after the first block
+   controller-level metric), so that half of the note has no counterpart in the
+   code and is not modelled. Quarantine is terminal: turns after the first block
    do not change the session outcome and are excluded from
    ``mean_prompt_tokens_terminal``.
+   Structural consequence: in the paper family below, a turn is blocked iff its
+   routing risk reaches the blocking threshold (tau_q; tau_h for 2 states), and
+   the routing risk (r_t, + eta*rho_{t-1} with memory) does not depend on the
+   controller state. At a common blocking threshold the 2/3/4-state and
+   monotone/downgrade variants therefore make identical session block
+   decisions; they differ in tokens and Hardened/Cautious occupancy, and memory
+   variants differ through tau_c (rho's pressure term), which the ratio rule
+   scales with the blocking threshold.
 4. Anything selected (trajectory policy, matched-BAR thresholds) is chosen on the
    selection side and reported on the evaluation side.
 """
 from __future__ import annotations
 
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .calibration_protocol import split_key
@@ -42,9 +51,12 @@ DEFAULT_MT_SPLIT_SEED = "rcdp-r1-multiturn"
 SESSION_ID_RE = re.compile(r"^(?P<seed>.+)-mt(?P<var>\d+)$")
 
 # Paper memory branch (A_appendix: lambda = 0.80, eta = 0.90) with asymmetric
-# (safe-streak, k_down = 2) downgrade and decayed history counters.
+# downgrade (one level at a time after k_down = safe_streak_to_downgrade = 2 safe
+# turns, ControllerConfig.downgrade_rule = "one-level") and decayed history counters.
 MEMORY = {"use_risk_memory": True, "risk_memory_decay": 0.80, "risk_memory_gain": 0.90}
-DOWNGRADE = {"allow_state_downgrade": True, "history_decay": 1}
+DOWNGRADE = {"allow_state_downgrade": True, "history_decay": 1, "downgrade_rule": "one-level"}
+# Submitted downgrade: the state is re-derived every turn (Quarantine can fall to Normal at once).
+DOWNGRADE_SHIPPED = {"allow_state_downgrade": True, "history_decay": 1, "downgrade_rule": "rederive"}
 PAPER = {"use_trajectory_features": False, "closed_state_set": True}
 SHIPPED_OFF = {"use_trajectory_features": False, "closed_state_set": False}
 SHIPPED_ON = {"use_trajectory_features": True, "closed_state_set": False}
@@ -57,13 +69,13 @@ for _n in (2, 3, 4):
     VARIANTS[f"{_n}-state-downgrade"] = ("paper", {"num_states": _n, **PAPER, **DOWNGRADE})
 for _n in (2, 3, 4):
     VARIANTS[f"{_n}-state+memory"] = ("paper", {"num_states": _n, **PAPER, **DOWNGRADE, **MEMORY})
-# Diagnostics: what the submitted code ran (open state sets; "+risk-memory" also
-# switched on use_trajectory_features). 4-state-downgrade is identical in both families.
+# Diagnostics: what the submitted code ran (open state sets; re-derived downgrades;
+# "+risk-memory" also switched on use_trajectory_features).
 VARIANTS["4-state-trajfeat-default"] = ("shipped", {})  # ControllerConfig() defaults
-for _n in (2, 3):
-    VARIANTS[f"{_n}-state-downgrade-shipped"] = ("shipped", {"num_states": _n, **SHIPPED_OFF, **DOWNGRADE})
 for _n in (2, 3, 4):
-    VARIANTS[f"{_n}-state+memory-shipped"] = ("shipped", {"num_states": _n, **SHIPPED_ON, **DOWNGRADE, **MEMORY})
+    VARIANTS[f"{_n}-state-downgrade-shipped"] = ("shipped", {"num_states": _n, **SHIPPED_OFF, **DOWNGRADE_SHIPPED})
+for _n in (2, 3, 4):
+    VARIANTS[f"{_n}-state+memory-shipped"] = ("shipped", {"num_states": _n, **SHIPPED_ON, **DOWNGRADE_SHIPPED, **MEMORY})
 
 POLICY_VARIANT = "trajectory-policy"
 POLICY_BASE_VARIANT = "4-state+memory"
@@ -78,7 +90,7 @@ CONTRASTS = [
     ("4-state+memory", "3-state+memory"),
     ("4-state+memory", "2-state+memory"),
     ("4-state-downgrade", "4-state"),
-    ("4-state+memory-shipped", "4-state-downgrade"),
+    ("4-state+memory-shipped", "4-state-downgrade-shipped"),
     (POLICY_VARIANT, "4-state+memory"),
     (POLICY_VARIANT, "4-state"),
 ]
@@ -87,7 +99,7 @@ MATCHED_VARIANTS = [
     "2-state", "3-state", "4-state",
     "2-state-downgrade", "3-state-downgrade", "4-state-downgrade",
     "2-state+memory", "3-state+memory", "4-state+memory",
-    "4-state+memory-shipped",
+    "4-state-downgrade-shipped", "4-state+memory-shipped",
 ]
 MATCHED_CONTRASTS = [
     ("4-state+memory", "4-state-downgrade"),
@@ -97,7 +109,7 @@ MATCHED_CONTRASTS = [
     ("4-state", "3-state"),
     ("4-state+memory", "2-state+memory"),
     ("4-state+memory", "3-state+memory"),
-    ("4-state+memory-shipped", "4-state-downgrade"),
+    ("4-state+memory-shipped", "4-state-downgrade-shipped"),
 ]
 # Export in the input format of b5_cluster_bootstrap.py (its fixed variant names).
 B5_EXPORT = OrderedDict([
@@ -197,9 +209,11 @@ def session_row(session: Dict[str, Any], records, config) -> Dict[str, Any]:
     }
 
 
-def turn_row(session: Dict[str, Any], k: int, rec) -> Dict[str, Any]:
+def turn_row(session: Dict[str, Any], k: int, rec, reasons: bool = True) -> Dict[str, Any]:
+    """Per-turn record; ``reasons`` (the scorer's explanation strings) is shared by all
+    variants of a run, so the runner keeps it for the first variant only."""
     md = rec.metadata
-    return {
+    row = {
         "example_id": rec.example_id,
         "session_id": session["example_id"],
         "label": rec.label,
@@ -213,8 +227,10 @@ def turn_row(session: Dict[str, Any], k: int, rec) -> Dict[str, Any]:
         "state": rec.state,
         "decision": rec.decision,
         "prompt_tokens": rec.prompt_tokens,
-        "reasons": md.get("reasons"),
     }
+    if reasons:
+        row["reasons"] = md.get("reasons")
+    return row
 
 
 def summarize_sessions(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -254,6 +270,12 @@ def summarize_sessions(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "final_turn_rule": {
             "abr_final": rate(sum(r["final_turn_blocked"] for r in harm), len(harm)),
             "bar_final": rate(sum(not r["final_turn_blocked"] for r in ben), len(ben)),
+        },
+        # sessions per label by the user turn (0-based) of the first block; blocks on the
+        # scripted opening turns mean the openers, not the seed request, decided the session
+        "first_block_turn": {
+            lab: dict(sorted(Counter(str(r["first_block_turn"]) for r in grp if r["blocked"]).items()))
+            for lab, grp in (("harmful", harm), ("benign", ben))
         },
         "harmful_reaching_hardened_or_quarantine": sum(r["reached_hardened_or_quarantine"] for r in harm),
         "note_hardened": "upper bound on what a Hardened output check could add; not a block rate",
@@ -326,21 +348,66 @@ def outcome_columns(sessions, outcomes_by_variant: Dict[str, Dict[int, Dict[str,
     return cols
 
 
+def config_from_json(d: Dict[str, Any]):
+    """Rebuild a ControllerConfig from the 'config' block of a runner output."""
+    from dataclasses import fields
+
+    from .controller import ControllerConfig
+
+    d = dict(d)
+    if "state_prompt_tokens" in d:
+        d["state_prompt_tokens"] = {ControllerState(k): v for k, v in d["state_prompt_tokens"].items()}
+    if "hazard_latch_min_state" in d:
+        d["hazard_latch_min_state"] = ControllerState(d["hazard_latch_min_state"])
+    known = {f.name for f in fields(ControllerConfig)}
+    return ControllerConfig(**{k: v for k, v in d.items() if k in known})
+
+
+def sessions_from_payload(variant: Dict[str, Any]):
+    """(sessions, probs) of one variant block of a runner output (calibrated scores are
+    state-independent, so any variant's per-turn scores serve every replay)."""
+    by_session: Dict[str, List[Tuple[int, float]]] = {}
+    for t in variant["turns"]:
+        by_session.setdefault(t["session_id"], []).append((t["user_turn"], t["calibrated_score"]))
+    sessions, probs = [], []
+    for r in variant["sessions"]:
+        sessions.append({k: r[k] for k in ("example_id", "cluster_id", "label", "benchmark", "side", "n_user_turns")})
+        probs.append([p for _, p in sorted(by_session[r["example_id"]])])
+    return sessions, probs
+
+
 def b5_export(sessions_rows_by_variant: Dict[str, List[Dict[str, Any]]],
               turn_rows_by_variant: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-    """Evaluation-side records in the format read by b5_cluster_bootstrap.py / b6."""
+    """Evaluation-side records in the format read by b5_cluster_bootstrap.py / b6.
+
+    b5 parses the seed cluster from '<seed>-mt<k>:turn-<i>', so record ids are
+    rewritten as '<cluster_id>-mt<k>:turn-<i>' (k = 1-based position of the
+    session within its cluster, i = user-turn index). This keeps external
+    dialogues with arbitrary ids usable; ``id_map`` gives the original ids.
+    """
     out = OrderedDict()
+    id_map: Dict[str, str] = {}
     for b5_name, ours in B5_EXPORT.items():
         if ours not in turn_rows_by_variant:
             continue
-        eval_ids = {r["example_id"] for r in sessions_rows_by_variant[ours] if r["side"] == "evaluation"}
+        alias: Dict[str, str] = {}
+        per_cluster: Dict[str, int] = {}
+        for r in sessions_rows_by_variant[ours]:
+            if r["side"] != "evaluation":
+                continue
+            per_cluster[r["cluster_id"]] = per_cluster.get(r["cluster_id"], 0) + 1
+            alias[r["example_id"]] = f'{r["cluster_id"]}-mt{per_cluster[r["cluster_id"]]}'
         recs = []
         for t in turn_rows_by_variant[ours]:
-            if t["session_id"] in eval_ids:
+            sid = t["session_id"]
+            if sid in alias:
+                id_map[alias[sid]] = sid
                 recs.append({
-                    "example_id": t["example_id"], "label": t["label"], "decision": t["decision"],
-                    "state": t["state"], "calibrated_score": t["calibrated_score"], "uncertainty": t["uncertainty"],
+                    "example_id": f'{alias[sid]}:turn-{t["user_turn"]}', "label": t["label"],
+                    "decision": t["decision"], "state": t["state"], "calibrated_score": t["calibrated_score"],
+                    "uncertainty": t["uncertainty"],
                 })
         out[b5_name] = {"source_variant": ours, "records": recs}
-    return {"state_ablation": out, "note": "evaluation side only; b5 variant 'N-state' = our 'N-state-downgrade', "
-                                          "'N-state+risk-memory' = our 'N-state+memory'"}
+    return {"state_ablation": out, "id_map": id_map,
+            "note": "evaluation side only, operating point delta = 0; b5 variant 'N-state' = our "
+                    "'N-state-downgrade' (memory off), 'N-state+risk-memory' = our 'N-state+memory' (memory on)"}

@@ -9,7 +9,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(1, str(HERE))
 
+from rcdp_hardened import calibration_summary  # noqa: E402
 from rcdp_guard.adaptive import (
     run_api_multiturn_state_manipulation_eval,
     run_api_rewrite_eval,
@@ -39,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-api-model", default=None)
     parser.add_argument("--num-candidates", type=int, default=3)
     parser.add_argument("--preservation-mode", default="strict", choices=["strict", "relaxed", "none"])
+    parser.add_argument("--calibration-protocol", default=None,
+                        help="r1 (default, or $RCDP_CALIBRATION_PROTOCOL), r1-no-platt, raw-threshold, legacy")
     return parser.parse_args()
 
 
@@ -67,12 +73,15 @@ def main() -> None:
         scorer=build_scorer(args),
         feature_config=FeatureConfig.all(),
     )
-    fit_calibrator(controller, load_examples(args.calibration_dataset))
+    fit_calibrator(controller, load_examples(args.calibration_dataset), protocol=args.calibration_protocol)
+    calibration = calibration_summary(controller)
+    calibration.pop("controller_config", None)
 
     result = {
         "protocol": {
             "dataset": args.dataset,
             "calibration_dataset": args.calibration_dataset,
+            "calibration": calibration,
             "scorer": args.scorer,
             "scorer_model_name": args.scorer_model_name if args.scorer != "keyword" else None,
             "scorer_cache_path": args.scorer_cache_path,

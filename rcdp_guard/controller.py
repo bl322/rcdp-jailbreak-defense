@@ -49,6 +49,20 @@ class ControllerConfig:
     # Hardened). False (default) keeps the submitted behaviour. Single-turn
     # routing is identical under both settings.
     closed_state_set: bool = False
+    # How a downgrade-enabled controller (allow_state_downgrade=True) may fall
+    # below the previous turn's state. Ignored when allow_state_downgrade=False
+    # (monotone: never below the previous state).
+    #   "rederive" (default, submitted behaviour): no constraint; the state is
+    #       re-derived from the current turn, so e.g. Quarantine can return to
+    #       Normal on the first safe turn.
+    #   "one-level" (paper, revised Fig. 2(d)): the state may fall at most one
+    #       level below the previous turn's state (Q->H->C->N; within the closed
+    #       state set for 2/3 states), and only on a turn that completes a run of
+    #       safe_streak_to_downgrade consecutive safe turns (calibrated risk
+    #       < tau_c, current turn included). A step consumes the run, so every
+    #       further step needs a new run; otherwise the previous state is held.
+    # Single-turn routing is identical under both settings.
+    downgrade_rule: str = "rederive"
     trajectory_decay: float = 0.72
     trajectory_gain: float = 0.45
     trajectory_trend_gain: float = 0.18
@@ -168,6 +182,7 @@ class RCDPController:
         prev_risk_level: float = 0.0,
         transition_score: float = 0.5,
         thresholds: dict[str, float] | None = None,
+        safe_run: int | None = None,
     ) -> ControllerState:
         return select_controller_state(
             calibrated=calibrated,
@@ -182,6 +197,7 @@ class RCDPController:
             prev_risk_level=prev_risk_level,
             transition_score=transition_score,
             thresholds=thresholds,
+            safe_run=safe_run,
         )
 
     def evaluate_example(self, example: Example) -> list[EvalRecord]:
@@ -197,6 +213,9 @@ class RCDPController:
         hazard_latched = False
         prev_calibrated = 0.0
         has_prev_turn = False
+        # Safe turns since the last risky turn or one-level downgrade step
+        # (downgrade_rule="one-level" only; no effect otherwise).
+        downgrade_run = 0
         thresholds = self.config.thresholds_for(example.benchmark)
         peak_effective_risk = 0.0
         peak_raw_score = 0.0
@@ -296,6 +315,7 @@ class RCDPController:
             original_effective_risk = effective_risk
             terminal_joint_risk = 0.0
             terminal_review_triggered = False
+            safe_run = downgrade_run + 1 if calibrated.probability < thresholds["tau_c"] else 0
             if terminal_review is not None:
                 # Review the final request in the context of preceding user
                 # turns. The auxiliary score is only a multi-turn terminal
@@ -333,6 +353,7 @@ class RCDPController:
                 ),
                 transition_score=transition_score,
                 thresholds=thresholds,
+                safe_run=safe_run,
             )
             if terminal_review_triggered:
                 # A softened final turn must not erase harmful intent established
@@ -348,6 +369,8 @@ class RCDPController:
                 and hazard_latched
             ):
                 state = ControllerState.QUARANTINE
+            stepped_down = prior_state is not None and _rank(state) < _rank(prior_state)
+            downgrade_run = 0 if stepped_down else safe_run
             decision = "block" if state == ControllerState.QUARANTINE else "allow"
             prompt_tokens = self.config.state_prompt_tokens[state]
 
@@ -528,7 +551,11 @@ def select_controller_state(
     prev_risk_level: float = 0.0,
     transition_score: float = 0.5,
     thresholds: dict[str, float] | None = None,
+    safe_run: int | None = None,
 ) -> ControllerState:
+    """``safe_run`` (needed only for downgrade_rule="one-level") is the number of
+    consecutive safe turns ending at the current turn, counted since the last
+    risky turn or one-level downgrade step (see RCDPController.evaluate_example)."""
     th = thresholds if thresholds is not None else config.thresholds
     tau_c = th["tau_c"]
     tau_h = th["tau_h"]
@@ -619,4 +646,32 @@ def select_controller_state(
     ):
         return prior_state
 
+    if (
+        config.allow_state_downgrade
+        and config.downgrade_rule != "rederive"
+        and prior_state is not None
+        and _rank(prior_state) > _rank(state)
+    ):
+        if config.downgrade_rule != "one-level":
+            raise ValueError(f"unknown downgrade_rule {config.downgrade_rule!r}")
+        if safe_run is None:
+            raise ValueError('downgrade_rule="one-level" needs safe_run')
+        if safe_run < config.safe_streak_to_downgrade:
+            return prior_state
+        ladder = _state_ladder(config, allow_cautious, allow_hardened)
+        below = [s for s in ladder if _rank(s) < _rank(prior_state)]
+        step = below[-1] if below else prior_state
+        return step if _rank(step) > _rank(state) else state
+
     return state
+
+
+def _state_ladder(config: ControllerConfig, allow_cautious: bool, allow_hardened: bool) -> list[ControllerState]:
+    """States of the variant in rank order (closed_state_set restricts 2/3 states)."""
+    out = [ControllerState.NORMAL]
+    if allow_cautious:
+        out.append(ControllerState.CAUTIOUS)
+    if allow_hardened:
+        out.append(ControllerState.HARDENED)
+    out.append(ControllerState.QUARANTINE)
+    return out

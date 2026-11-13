@@ -18,7 +18,18 @@ DATA = {
     "data/paper_splits/heldout_204.jsonl": 204,
     "data/external/mixed_harm149_xstest250.jsonl": 399,
     "data/paper_splits/calibration_v2_external_benign.jsonl": 346,
+    "data/paper_splits/mixed_harm149_xstest_test100.jsonl": 249,
 }
+CAL = "data/paper_splits/full_pool_calibration.jsonl"
+CAL_V2 = "data/paper_splits/calibration_v2_external_benign.jsonl"
+HELDOUT = "data/paper_splits/heldout_204.jsonl"
+MIXED399 = "data/external/mixed_harm149_xstest250.jsonl"
+TEST249 = "data/paper_splits/mixed_harm149_xstest_test100.jsonl"
+# (calibration pool, evaluation set) pairs that r1_stage1_run.sh actually runs. Only these must be disjoint:
+# the 346 pool contains 150 XSTest prompts of the 399 set by construction, so the 346 pool is evaluated on
+# the 249 set (149 harmful + the 100 XSTest prompts outside the pool) and never on the 399 set.
+PAIRS = [(CAL, HELDOUT), (CAL, MIXED399), (CAL, TEST249), (CAL_V2, HELDOUT), (CAL_V2, TEST249)]
+OPTIONAL = (CAL_V2, TEST249)  # only needed for the 196-vs-346 pool contrast
 
 
 def main() -> int:
@@ -48,7 +59,7 @@ def main() -> int:
         p = Path(rel)
         if not p.exists():
             print(f"MISSING  {rel}")
-            ok = ok and "calibration_v2" in rel  # the 346 pool is only needed for the Table 2 contrast
+            ok = ok and rel in OPTIONAL
             continue
         rows = [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
         labels = {}
@@ -58,15 +69,17 @@ def main() -> int:
         print(f"{flag:12s} {rel}: {len(rows)} rows {labels}")
         ok = ok and len(rows) == expected
         ids[rel] = {str(r.get("example_id")) for r in rows}
-    cal = ids.get("data/paper_splits/full_pool_calibration.jsonl", set())
-    for rel, s in ids.items():
-        if "calibration" in rel:
+    cal = ids.get(CAL, set())
+    for crel, erel in PAIRS:
+        if crel not in ids or erel not in ids:
             continue
-        for crel in ("data/paper_splits/full_pool_calibration.jsonl", "data/paper_splits/calibration_v2_external_benign.jsonl"):
-            ov = ids.get(crel, set()) & s
-            if ov:
-                print(f"OVERLAP  {rel} shares {len(ov)} ids with {crel}")
-                ok = False
+        ov = ids[crel] & ids[erel]
+        print(f"{'OVERLAP' if ov else 'disjoint':8s} {crel} x {erel}: {len(ov)} shared ids")
+        ok = ok and not ov
+    if CAL_V2 in ids and MIXED399 in ids:  # informational: this pair is never run
+        print(f"info     {CAL_V2} x {MIXED399}: {len(ids[CAL_V2] & ids[MIXED399])} shared ids (expected 150; pair not run)")
+    if TEST249 in ids and MIXED399 in ids:
+        print(f"info     {TEST249} subset of {MIXED399}: {ids[TEST249] <= ids[MIXED399]}")
     print("PREFLIGHT", "OK" if ok and cal else "FAILED")
     return 0 if ok and cal else 1
 

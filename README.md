@@ -1,5 +1,7 @@
 # RCDP source code
 
+Public repository: <https://github.com/bl322/rcdp-jailbreak-defense>
+
 Implements **Risk-Calibrated Dynamic Prompting (RCDP)** and the experiments
 reported in the companion manuscript
 (*"Risk-Calibrated Stateful Control for Inference-Time Jailbreak Defense"*).
@@ -48,6 +50,44 @@ No credentials, internal addresses, or machine-specific paths are hardcoded:
 | `RCDP_EXPERIMENTS` | package root (parent of `scripts/`) | root directory that holds `rcdp_guard/`, the benchmark data, and cached scorers |
 | `RCDP_API_BASE` | `http://localhost:30001/v1` | base URL of the OpenAI-compatible inference endpoint used by the API backends |
 | `OPENAI_API_KEY` | — | API key for the endpoint above, when required |
+
+## Calibration protocol (revision R1)
+
+`rcdp_guard/calibration_protocol.py` implements the protocol stated in the paper.
+`rcdp_guard.evaluation.fit_calibrator` uses it by default, so every script that
+fits a controller follows the same steps:
+
+1. The calibration pool is split into disjoint subsets D_head / D_platt / D_thresh
+   (100 / 48 / 48 of 196). Examples are ordered by (label, benchmark,
+   SHA-256(`"<seed>:<example_id>"`)), and the seed defaults to `rcdp-r1`.
+2. An L2 logistic risk head (C = 0.5, learning rate 0.1, 300 full-batch epochs) is
+   fitted on D_head.
+3. Platt scaling r = σ(a·s̃ + b_cal) is fitted on the head logits of D_platt.
+4. The blocking threshold is chosen on D_thresh by maximising
+   J = BlockRate − 1.0·FPR over τ ∈ {0.01, …, 0.99}. Ties go to the higher
+   BlockRate, then to the median of the tied run. τ_c and τ_h keep their default
+   ratios to τ_q. In benchmark-aware mode one τ_q is chosen per benchmark.
+
+The submitted runs used an unpenalised head on the whole pool with default
+thresholds. They also applied a turn-1 trend boost that blocked single-turn
+requests at r ≥ 0.6911 instead of τ_q. `RCDP_CALIBRATION_PROTOCOL=legacy`
+reproduces those runs exactly. `r1-no-platt` and `raw-threshold` are the
+ablations.
+
+All single-turn tables come from one command:
+
+```bash
+python scripts/run_r1_main.py \
+  --calibration-dataset data/paper_splits/full_pool_calibration.jsonl \
+  --heldout-dataset data/paper_splits/heldout_204.jsonl \
+  --external-dataset data/external/mixed_harm149_xstest250.jsonl \
+  --scorer distilbart-mnli --scorer-model-name valhalla/distilbart-mnli-12-3 \
+  --scorer-device cuda --output results/r1/main_dist.json
+```
+
+The output records the code hash, the split IDs of every subset, the head
+weights, the Platt parameters, the complete threshold-search table, and
+per-item calibration and evaluation records.
 
 ## Running
 

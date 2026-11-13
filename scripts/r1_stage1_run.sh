@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Revision R1, stage 1: single-turn main tables.
-# Usage:  cd $RCDP_EXPERIMENTS && bash scripts/r1_stage1_run.sh
+# Usage:  export RCDP_EXPERIMENTS=/path/to/experiments && bash "$RCDP_EXPERIMENTS/scripts/r1_stage1_run.sh"
+#         (without the export the root defaults to the parent directory of this script)
 # Optional environment:
 #   DIST_MODEL / DEB_MODEL / LG_MODEL  scorer names or local paths (LG_MODEL empty = skip Llama-Guard)
+#   DEB_MODEL should be a local snapshot directory (.../snapshots/<rev>/): with a hub id, transformers 4.57
+#   calls model_info() while loading the DeBERTa tokenizer, even with --scorer-local-files-only, and fails offline.
 #   DEVICE=cuda|cpu   SCORER_FLAGS="--scorer-local-files-only"   FORCE=1 (continue past a failed gate)
 set -euo pipefail
-cd "${RCDP_EXPERIMENTS:?set RCDP_EXPERIMENTS to the experiments root}"
+RCDP_EXPERIMENTS=${RCDP_EXPERIMENTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+export RCDP_EXPERIMENTS
+cd "$RCDP_EXPERIMENTS"
 
 DIST=${DIST_MODEL:-valhalla/distilbart-mnli-12-3}
 DEB=${DEB_MODEL:-MoritzLaurer/deberta-v3-large-zeroshot-v2.0}
@@ -14,6 +19,10 @@ DEV=${DEVICE:-cuda}
 EXTRA=${SCORER_FLAGS:-}
 OUT=results/r1
 mkdir -p "$OUT"
+[ -d "$DEB" ] || echo "WARNING: DEB_MODEL=$DEB is not a local directory; offline loading may fail (see header)"
+
+MIXED399=data/external/mixed_harm149_xstest250.jsonl          # 149 harmful + 250 XSTest safe
+TEST249=data/paper_splits/mixed_harm149_xstest_test100.jsonl   # 149 harmful + the 100 XSTest safe outside the 346 pool
 
 echo "== preflight"
 python scripts/r1_preflight.py | tee "$OUT/preflight.log"
@@ -42,22 +51,28 @@ if bad:
 print("GATE OK")
 PY
 
-run () {  # $1 tag, $2 scorer, $3 model, $4 calibration pool stem
-  echo "== $1 / $4"
+run () {  # $1 tag, $2 scorer, $3 model, $4 calibration pool stem, $5... external evaluation sets
+  local tag=$1 scorer=$2 model=$3 pool=$4
+  shift 4
+  local ext=()
+  for f in "$@"; do ext+=(--external-dataset "$f"); done
+  echo "== $tag / $pool"
   python scripts/run_r1_main.py \
-    --calibration-dataset "data/paper_splits/$4.jsonl" \
+    --calibration-dataset "data/paper_splits/$pool.jsonl" \
     --heldout-dataset data/paper_splits/heldout_204.jsonl \
-    --external-dataset data/external/mixed_harm149_xstest250.jsonl \
-    --scorer "$2" --scorer-model-name "$3" --scorer-device "$DEV" $EXTRA \
-    --output "$OUT/main_$1_$4.json" 2>&1 | tee "$OUT/main_$1_$4.log"
+    "${ext[@]}" \
+    --scorer "$scorer" --scorer-model-name "$model" --scorer-device "$DEV" $EXTRA \
+    --output "$OUT/main_${tag}_${pool}.json" 2>&1 | tee "$OUT/main_${tag}_${pool}.log"
 }
 
-run dist distilbart-mnli "$DIST" full_pool_calibration
-run deb  distilbart-mnli "$DEB"  full_pool_calibration
-if [ -n "$LG" ]; then run lg llama-guard "$LG" full_pool_calibration; else echo "== Llama-Guard skipped (LG_MODEL empty)"; fi
+# 196 pool: both external sets (the 249 set gives the like-for-like 196-vs-346 pool contrast)
+run dist distilbart-mnli "$DIST" full_pool_calibration "$MIXED399" "$TEST249"
+run deb  distilbart-mnli "$DEB"  full_pool_calibration "$MIXED399" "$TEST249"
+if [ -n "$LG" ]; then run lg llama-guard "$LG" full_pool_calibration "$MIXED399" "$TEST249"; else echo "== Llama-Guard skipped (LG_MODEL empty)"; fi
+# 346 pool = 196 + 150 XSTest safe prompts of the 399 set, so it is evaluated on the 249 set only
 if [ -f data/paper_splits/calibration_v2_external_benign.jsonl ]; then
-  run dist distilbart-mnli "$DIST" calibration_v2_external_benign
-  run deb  distilbart-mnli "$DEB"  calibration_v2_external_benign
+  run dist distilbart-mnli "$DIST" calibration_v2_external_benign "$TEST249"
+  run deb  distilbart-mnli "$DEB"  calibration_v2_external_benign "$TEST249"
 fi
 
 tar czf results_r1_stage1.tgz "$OUT"
