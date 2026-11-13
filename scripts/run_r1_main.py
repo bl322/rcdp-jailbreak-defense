@@ -62,7 +62,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--external-dataset", action="append", default=[],
                    help="additional evaluation set (repeatable); never used for fitting")
     p.add_argument("--output", required=True)
-    p.add_argument("--scorer", default="distilbart-mnli", choices=["keyword", "distilbart-mnli", "llama-guard"])
+    p.add_argument("--scorer", default="distilbart-mnli",
+                   choices=["keyword", "distilbart-mnli", "llama-guard", "llama-guard-prob"],
+                   help="llama-guard: verdict score (0.99/0.01, as submitted); "
+                        "llama-guard-prob: P(unsafe) at the verdict token (graded)")
     p.add_argument("--scorer-model-name", default="valhalla/distilbart-mnli-12-3")
     p.add_argument("--scorer-local-files-only", action="store_true")
     p.add_argument("--scorer-device", default="cpu")
@@ -81,9 +84,10 @@ def build_scorer(args):
 
     if args.scorer == "keyword":
         return KeywordRiskScorer()
-    if args.scorer == "llama-guard":
+    if args.scorer in ("llama-guard", "llama-guard-prob"):
         return LlamaGuardRiskScorer(model_name=args.scorer_model_name, local_files_only=args.scorer_local_files_only,
-                                    device=args.scorer_device, cache_path=args.scorer_cache_path)
+                                    device=args.scorer_device, cache_path=args.scorer_cache_path,
+                                    score_mode="prob" if args.scorer == "llama-guard-prob" else "label")
     return DistilBartMNLIRiskScorer(model_name=args.scorer_model_name, local_files_only=args.scorer_local_files_only,
                                     device=args.scorer_device, cache_path=args.scorer_cache_path)
 

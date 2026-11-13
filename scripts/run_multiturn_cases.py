@@ -1,7 +1,7 @@
 """Multi-turn evaluation of revision R1 (Table S5 / Figure 4; ledger R2-1, R3-4).
 
 Protocol (rcdp_guard/multiturn.py has the details):
-  * One scorer (--scorer keyword | distilbart-mnli | llama-guard, as in
+  * One scorer (--scorer keyword | distilbart-mnli | llama-guard | llama-guard-prob, as in
     scripts/run_r1_main.py) is shared by every variant.
   * Every variant is calibrated with the paper's single-turn protocol on the
     single-turn calibration pool only (--calibration-dataset); dialogues are
@@ -111,13 +111,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--selection-fraction", type=float, default=0.5, help="hash split only")
     p.add_argument("--split-seed", default=MT.DEFAULT_MT_SPLIT_SEED, help="hash split only")
     p.add_argument("--output", required=True)
-    p.add_argument("--scorer", default="distilbart-mnli", choices=["keyword", "distilbart-mnli", "llama-guard"])
+    p.add_argument("--scorer", default="distilbart-mnli",
+                   choices=["keyword", "distilbart-mnli", "llama-guard", "llama-guard-prob"],
+                   help="llama-guard: verdict score (0.99/0.01, as submitted); "
+                        "llama-guard-prob: P(unsafe) at the verdict token (graded)")
     p.add_argument("--scorer-model-name", default="valhalla/distilbart-mnli-12-3")
     p.add_argument("--scorer-local-files-only", action="store_true")
     p.add_argument("--scorer-device", default="cpu")
     p.add_argument("--scorer-cache-path", default=None)
     p.add_argument("--scorer-history", choices=["auto", "on", "off"], default="auto",
-                   help="pass earlier turns to the scorer; auto = off for llama-guard (as in the submitted runner), on otherwise")
+                   help="pass earlier turns to the scorer; auto = off for llama-guard and llama-guard-prob (as in the submitted runner), on otherwise")
     p.add_argument("--settings", default="agnostic,aware", help="comma list of agnostic, aware")
     p.add_argument("--variants", default="all", help="all | paper | shipped | comma list of names in rcdp_guard.multiturn.VARIANTS")
     p.add_argument("--calibration-protocol", default="r1", choices=PROTOCOLS)
@@ -138,9 +141,10 @@ def build_scorer(args):
 
     if args.scorer == "keyword":
         return KeywordRiskScorer()
-    if args.scorer == "llama-guard":
+    if args.scorer in ("llama-guard", "llama-guard-prob"):
         return LlamaGuardRiskScorer(model_name=args.scorer_model_name, local_files_only=args.scorer_local_files_only,
-                                    device=args.scorer_device, cache_path=args.scorer_cache_path)
+                                    device=args.scorer_device, cache_path=args.scorer_cache_path,
+                                    score_mode="prob" if args.scorer == "llama-guard-prob" else "label")
     return DistilBartMNLIRiskScorer(model_name=args.scorer_model_name, local_files_only=args.scorer_local_files_only,
                                     device=args.scorer_device, cache_path=args.scorer_cache_path)
 
@@ -361,7 +365,7 @@ def main(argv=None) -> None:
         variant_names.append(MT.POLICY_BASE_VARIANT)
 
     base_scorer = build_scorer(args)
-    use_history = args.scorer_history == "on" or (args.scorer_history == "auto" and args.scorer != "llama-guard")
+    use_history = args.scorer_history == "on" or (args.scorer_history == "auto" and not args.scorer.startswith("llama-guard"))
     scorer = MemoizingScorer(ScorerAdapter(base_scorer, use_history))
     scorer_info = {"scorer_class": type(base_scorer).__name__, "scorer_history": use_history}
 

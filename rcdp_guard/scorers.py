@@ -339,8 +339,19 @@ class LlamaGuardRiskScorer:
     local_files_only: bool = False
     torch_dtype: str | None = None
     cache_path: str | None = None
+    # "label": raw score from the parsed verdict (0.99 / 0.01; 0.95 / 0.05 / 0.50 for unparsed
+    #          output), as in the submitted runs.
+    # "prob":  raw score = P(unsafe) = softmax over the "unsafe" and "safe" tokens at the generated
+    #          verdict position (same template and greedy decoding; identical to the P(unsafe) of
+    #          scripts/scorer_baselines_r1/llama_guard_oneshot.py). Falls back to the label score,
+    #          flagged in the reasons, if no verdict token is generated.
+    score_mode: str = "label"
+
+    SCORE_MODES = ("label", "prob")
 
     def __post_init__(self) -> None:
+        if self.score_mode not in self.SCORE_MODES:
+            raise ValueError(f"score_mode must be one of {self.SCORE_MODES}, got {self.score_mode!r}")
         try:
             _ensure_text_only_torchvision_stub()
             import torch
@@ -380,6 +391,52 @@ class LlamaGuardRiskScorer:
         self._model.eval()
         self._model.to(self.device)
         self._cache = PersistentScoreCache(self.cache_path)
+        self._verdict_ids = self._resolve_verdict_ids() if self.score_mode == "prob" else None
+
+    def _resolve_verdict_ids(self) -> dict:
+        ids = {}
+        for word in ("unsafe", "safe"):
+            enc = self._tokenizer.encode(word, add_special_tokens=False)
+            if len(enc) != 1:
+                raise RuntimeError(f"score_mode='prob' needs '{word}' to be a single token; got {enc}")
+            ids[word] = int(enc[0])
+        return ids
+
+    def _cache_scorer_name(self) -> str:
+        # The label mode keeps the submitted cache key, so existing caches stay valid; the prob mode
+        # never reads label-mode entries.
+        name = self.__class__.__name__
+        return name if self.score_mode == "label" else f"{name}:prob"
+
+    def _generate_with_logits(self, encoded: dict):
+        kwargs = dict(
+            max_new_tokens=self.max_new_tokens,
+            do_sample=False,
+            pad_token_id=self._tokenizer.eos_token_id or 0,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        try:
+            out = self._model.generate(**encoded, output_logits=True, **kwargs)
+            return out.sequences, out.logits, "logits"
+        except (TypeError, ValueError):  # transformers without output_logits
+            out = self._model.generate(**encoded, **kwargs)
+            return out.sequences, out.scores, "scores"
+
+    def _verdict_probability(self, generated_ids, steps) -> dict:
+        ids = generated_ids.tolist() if hasattr(generated_ids, "tolist") else list(generated_ids)
+        for step, tid in enumerate(ids):
+            piece = self._tokenizer.decode([tid]).strip().lower()
+            if piece in ("safe", "unsafe") and step < len(steps):
+                row = steps[step][0]
+                lu = float(row[self._verdict_ids["unsafe"]])
+                ls = float(row[self._verdict_ids["safe"]])
+                # log_softmax(x)[u] - log_softmax(x)[s] = x[u] - x[s], so this equals the
+                # one-shot script's 1 / (1 + exp(logp_safe - logp_unsafe)).
+                return {"p_unsafe": sigmoid(lu - ls), "logit_unsafe": lu, "logit_safe": ls,
+                        "verdict_step": step, "verdict_token": piece}
+        return {"p_unsafe": None, "verdict_step": None}
+
     def _build_messages(self, text: str, history: list[str] | None = None) -> list[dict]:
         messages: list[dict] = []
         if history:
@@ -536,7 +593,7 @@ class LlamaGuardRiskScorer:
 
     def score(self, text: str, history: list[str] | None = None, metadata: dict | None = None) -> ScoreResult:
         cache_key = self._cache.build_key(
-            scorer_name=self.__class__.__name__,
+            scorer_name=self._cache_scorer_name(),
             model_name=self.model_name,
             text=text,
             history=history,
@@ -556,13 +613,17 @@ class LlamaGuardRiskScorer:
         encoded = {k: v.to(self.device) for k, v in encoded.items()}
 
         generated_text = ""
+        steps, logit_source = None, None
         with self._torch.no_grad():
-            generated = self._model.generate(
-                **encoded,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                pad_token_id=self._tokenizer.eos_token_id or 0,
-            )
+            if self.score_mode == "prob":
+                generated, steps, logit_source = self._generate_with_logits(encoded)
+            else:
+                generated = self._model.generate(
+                    **encoded,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self._tokenizer.eos_token_id or 0,
+                )
         prompt_len = encoded["input_ids"].shape[-1]
         generated_text = self._tokenizer.decode(
             generated[0][prompt_len:], skip_special_tokens=True
@@ -582,15 +643,22 @@ class LlamaGuardRiskScorer:
             else:
                 raw_score = 0.50
 
-        result = ScoreResult(
-            raw_score=raw_score,
-            reasons=[f"generated_label={first_line or 'unknown'}"],
-            metadata={
-                "generated_label": generated_text,
-                "parsed_label": first_line or None,
-                "model_name": self.model_name,
-            },
-        )
+        reasons = [f"generated_label={first_line or 'unknown'}"]
+        meta = {
+            "generated_label": generated_text,
+            "parsed_label": first_line or None,
+            "model_name": self.model_name,
+        }
+        if self.score_mode == "prob":
+            prob = self._verdict_probability(generated[0][prompt_len:], steps)
+            meta.update(score_mode="prob", logit_source=logit_source, label_score=raw_score, **prob)
+            if prob["p_unsafe"] is not None:
+                raw_score = prob["p_unsafe"]
+                reasons.append("score=P(unsafe) at the verdict token")
+            else:
+                reasons.append("prob_fallback=label (no verdict token generated)")
+
+        result = ScoreResult(raw_score=raw_score, reasons=reasons, metadata=meta)
         self._cache.put(cache_key, result)
         return result
 
