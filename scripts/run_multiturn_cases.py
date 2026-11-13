@@ -128,6 +128,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--alpha", type=float, default=DEFAULT_ALPHA, help="J = BlockRate - alpha * FPR (calibration and policy search)")
     p.add_argument("--delta-step", type=float, default=0.01, help="frontier grid step of the blocking-threshold shift")
     p.add_argument("--no-frontier", action="store_true")
+    p.add_argument("--export-delta-outcomes", action="store_true",
+                   help="also write <output>.<setting>.delta_outcomes.json: evaluation-side blocked flag of every "
+                        "session at every threshold shift (input of scripts/multiturn_matched_external.py)")
     p.add_argument("--bar-targets", default="fitted,0.70,0.80,0.90",
                    help="matched-BAR targets; 'fitted' = selection-side BAR of each matched variant at its operating point")
     p.add_argument("--policy-space", default="r1", help="r1 | small | none | path to a JSON dict of value lists")
@@ -420,6 +423,7 @@ def main(argv=None) -> None:
         t_set = time.perf_counter()
         runs = OrderedDict()
         frontiers = {}
+        douts = OrderedDict()
         for name in variant_names:
             family, overrides = MT.VARIANTS[name]
             t0 = time.perf_counter()
@@ -430,6 +434,8 @@ def main(argv=None) -> None:
             runs[name] = run
             if not args.no_frontier:
                 frontiers[name] = MT.frontier(sessions, run.probs, run.config, run.th_fn, deltas)
+            if args.export_delta_outcomes:
+                douts[name] = MT.delta_outcomes(sessions, run.probs, run.config, run.th_fn, deltas)
             ev = MT.summarize_sessions([r for r in run.session_rows if r["side"] == "evaluation"])
             print(f"{setting:8s} {name:28s} tau_block={run.config.thresholds[PS.block_key(run.config.num_states)]:.3f} "
                   f"eval ABR {ev['blocked_harmful']}/{ev['n_harmful']} BAR {ev['allowed_benign']}/{ev['n_benign']} "
@@ -444,6 +450,8 @@ def main(argv=None) -> None:
             runs[MT.POLICY_VARIANT] = prun
             if not args.no_frontier:
                 frontiers[MT.POLICY_VARIANT] = MT.frontier(sessions, prun.probs, prun.config, prun.th_fn, deltas)
+            if args.export_delta_outcomes:
+                douts[MT.POLICY_VARIANT] = MT.delta_outcomes(sessions, prun.probs, prun.config, prun.th_fn, deltas)
             ev = MT.summarize_sessions([r for r in prun.session_rows if r["side"] == "evaluation"])
             policy["evaluation_summary"] = ev
             print(f"{setting:8s} {MT.POLICY_VARIANT:28s} best={policy['best']} J_sel={policy['best_J']:.4f} "
@@ -468,6 +476,15 @@ def main(argv=None) -> None:
         b5_path.parent.mkdir(parents=True, exist_ok=True)
         b5_path.write_text(json.dumps(b5, ensure_ascii=False), encoding="utf-8")
         sout["b5_export"] = str(b5_path)
+        if douts:
+            d_path = Path(args.output).with_name(Path(args.output).stem + f".{setting}.delta_outcomes.json")
+            d_path.write_text(json.dumps({
+                "setting": setting, "dataset": args.dataset, "scorer": args.scorer,
+                "delta_step": args.delta_step, "side": "evaluation",
+                "sessions": [{k: s[k] for k in ("example_id", "cluster_id", "label", "benchmark", "n_user_turns")}
+                             for s in sessions if s["side"] == "evaluation"],
+                "variants": douts}, ensure_ascii=False), encoding="utf-8")
+            sout["delta_outcomes_export"] = str(d_path)
         sout["seconds"] = time.perf_counter() - t_set
         out["settings"][setting] = sout
 

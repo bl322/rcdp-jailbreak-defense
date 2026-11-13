@@ -330,6 +330,38 @@ def choose_matched_delta(points: Sequence[Dict[str, Any]], target_bar: float) ->
     return {"point": best, "target_reached": False}
 
 
+def delta_outcomes(
+    sessions: Sequence[Dict[str, Any]],
+    probs: Sequence[Sequence[float]],
+    config,
+    thresholds_fn,
+    deltas: Sequence[float],
+    side: str = "evaluation",
+) -> List[Dict[str, Any]]:
+    """Per-session blocked flags on one side for each distinct shift of the blocking threshold.
+
+    Same grid, threshold shift and de-duplication as frontier(); ``blocked`` is a 0/1 string in the
+    order of the sessions on that side. Input of scripts/multiturn_matched_external.py, which matches
+    BAR on the evaluation side and bootstraps the matching itself.
+    """
+    bkey = block_key(config.num_states)
+    benches = sorted({s["benchmark"] for s in sessions})
+    idx = [i for i, s in enumerate(sessions) if s["side"] == side]
+    seen = set()
+    points = []
+    for delta in deltas:
+        delta = round(float(delta), 6)
+        cache = {b: shift_block_threshold(thresholds_fn(b), delta, bkey) for b in benches}
+        sig = tuple((b, round(cache[b][bkey], 9)) for b in benches)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        outs = replay_outcomes(sessions, probs, config, cache.__getitem__, indices=idx)
+        points.append({"delta": delta, "block_thresholds": {b: cache[b][bkey] for b in benches},
+                       "blocked": "".join("1" if outs[i]["blocked"] else "0" for i in idx)})
+    return points
+
+
 def default_deltas(step: float = 0.01) -> List[float]:
     n = int(round(1.0 / step))
     return [round(k * step, 6) for k in range(-n, n + 1)]
