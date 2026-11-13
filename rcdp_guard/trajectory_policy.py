@@ -45,7 +45,13 @@ def fit_trajectory_policy(
     learning_rate: float = 0.05,
     l2: float = 1e-4,
 ) -> LearnedTrajectoryPolicy:
-    """Fit a lightweight learned transition gate from calibration trajectories."""
+    """Fit a lightweight learned transition gate from calibration trajectories.
+
+    Not the paper's method: the paper selects the trajectory configuration
+    from a finite candidate set (rcdp_guard.policy_search.search_trajectory_policy_r1)
+    and states that no separate gate is trained. Kept for the submitted
+    ``use_learned_transition_policy`` ablation only.
+    """
 
     rows: list[dict[str, float]] = []
     labels: list[int] = []
@@ -60,6 +66,7 @@ def fit_trajectory_policy(
         prev_calibrated = 0.0
         total_user_turns = sum(1 for turn in example.turns if turn.role == "user") or 1
         user_turn_index = 0
+        th = controller.config.thresholds_for(example.benchmark)
 
         for turn in example.turns:
             if turn.role != "user":
@@ -98,7 +105,7 @@ def fit_trajectory_policy(
             rows.append(features)
             labels.append(1 if str(example.label.value) == "harmful" else 0)
 
-            pressure = max(0.0, calibrated.probability - controller.config.thresholds["tau_c"])
+            pressure = max(0.0, calibrated.probability - th["tau_c"])
             if controller.config.use_risk_memory:
                 risk_memory = controller.config.risk_memory_decay * risk_memory + pressure
             elif controller.config.use_trajectory_features:
@@ -106,19 +113,19 @@ def fit_trajectory_policy(
             else:
                 risk_memory = 0.0
 
-            if calibrated.probability < controller.config.thresholds["tau_c"]:
+            if calibrated.probability < th["tau_c"]:
                 safe_streak += 1
                 risky_streak = 0
             else:
                 risky_streak += 1
                 safe_streak = 0
 
-            if calibrated.probability >= controller.config.thresholds["tau_q"]:
+            if calibrated.probability >= th["tau_q"]:
                 prior_state_rank = 3
                 prior_high_risk_turns += 1
-            elif calibrated.probability >= controller.config.thresholds["tau_h"]:
+            elif calibrated.probability >= th["tau_h"]:
                 prior_state_rank = max(prior_state_rank, 2)
-            elif calibrated.probability >= controller.config.thresholds["tau_c"]:
+            elif calibrated.probability >= th["tau_c"]:
                 prior_state_rank = max(prior_state_rank, 1)
                 prior_cautious_turns += 1
             else:
@@ -138,7 +145,7 @@ def fit_trajectory_policy(
     pos_weight = neg_count / max(pos_count, 1)
 
     for _ in range(epochs):
-        for features, label in zip(rows, labels, strict=False):
+        for features, label in zip(rows, labels):
             score = bias
             for name in FEATURE_NAMES:
                 score += weights[name] * features.get(name, 0.0)

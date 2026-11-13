@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from pathlib import Path
 
+from .calibration_protocol import DEFAULT_ALPHA, DEFAULT_SEED, fit_protocol
 from .controller import ControllerConfig, RCDPController
 from .datasets import load_examples
 from .trajectory_policy import fit_trajectory_policy
@@ -18,27 +20,27 @@ def stable_split(examples, ratio: float = 0.5):
     return cal, test
 
 
-def fit_calibrator(controller: RCDPController, examples) -> None:
-    rows = []
-    labels = []
-    for ex in examples:
-        history: list[str] = []
-        for turn in ex.turns:
-            if turn.role != "user":
-                history.append(turn.text)
-                continue
-            score_result = controller.scorer.score(turn.text, history, ex.metadata)
-            features = controller.calibrate(
-                raw_score=score_result.raw_score,
-                text=turn.text,
-                benchmark=ex.benchmark,
-                prior_high_risk_turns=0,
-                prior_cautious_turns=0,
-            ).features
-            rows.append(features)
-            labels.append(1 if ex.label == Label.HARMFUL else 0)
-            history.append(turn.text)
-    controller.calibrator.fit(rows, labels)
+def calibration_protocol_from_env(default: str = "r1") -> str:
+    """RCDP_CALIBRATION_PROTOCOL selects r1 (default), r1-no-platt, raw-threshold or legacy."""
+    return os.environ.get("RCDP_CALIBRATION_PROTOCOL", default).strip().lower()
+
+
+def fit_calibrator(controller: RCDPController, examples, protocol: str | None = None,
+                   seed: str | None = None, alpha: float | None = None) -> dict:
+    """Fit the calibration stages on calibration data and set the operating point.
+
+    The default is the paper's protocol (three disjoint subsets: ridge head,
+    Platt layer, threshold search). ``protocol="legacy"`` (or
+    RCDP_CALIBRATION_PROTOCOL=legacy) reproduces the submitted runs. Returns
+    the protocol report, which is also stored on ``controller.calibration_report``.
+    """
+    return fit_protocol(
+        controller,
+        examples,
+        protocol or calibration_protocol_from_env(),
+        seed=seed or os.environ.get("RCDP_SPLIT_SEED", DEFAULT_SEED),
+        alpha=DEFAULT_ALPHA if alpha is None else alpha,
+    )
 
 
 def evaluate_dataset(dataset_path: str, controller: RCDPController) -> dict:

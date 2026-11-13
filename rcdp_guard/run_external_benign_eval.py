@@ -33,6 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scorer-device", default="cpu")
     parser.add_argument("--scorer-cache-path", default=None)
     parser.add_argument("--benchmark-aware", action="store_true")
+    parser.add_argument("--calibration-protocol", default=None,
+                        choices=["r1", "r1-no-platt", "raw-threshold", "legacy"],
+                        help="default: RCDP_CALIBRATION_PROTOCOL or r1 (the paper's protocol)")
+    parser.add_argument("--split-seed", default=None)
     parser.add_argument("--use-hazard-latch", action="store_true")
     parser.add_argument("--enable-transformation-views", action="store_true")
     parser.add_argument("--transformation-max-views", type=int, default=3)
@@ -74,13 +78,22 @@ def main() -> None:
 
     # Fit exclusively on the original calibration partition. The external suite is never
     # used to learn the calibrator or choose an operating point.
-    fit_calibrator(controller, load_examples(args.calibration_dataset))
+    calibration_report = fit_calibrator(
+        controller,
+        load_examples(args.calibration_dataset),
+        protocol=args.calibration_protocol,
+        seed=args.split_seed,
+    )
     records = []
     for example in load_examples(args.external_dataset):
         records.extend(controller.evaluate_example(example))
 
     summary = summarize(records)
+    summary["calibration"] = calibration_report
     summary["protocol"] = {
+        "calibration_protocol": calibration_report.get("protocol"),
+        "thresholds": dict(controller.config.thresholds),
+        "benchmark_thresholds": controller.config.benchmark_thresholds,
         "evaluation": "zero-shot external benign generalization",
         "calibration_dataset": args.calibration_dataset,
         "external_dataset": args.external_dataset,
@@ -93,7 +106,8 @@ def main() -> None:
         "scorer_cache_path": args.scorer_cache_path if args.scorer in {"distilbart-mnli", "llama-guard"} else None,
     }
     write_summary(summary, args.output)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(json.dumps({k: v for k, v in summary.items() if k not in {"records", "calibration"}},
+                     ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

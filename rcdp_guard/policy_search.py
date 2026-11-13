@@ -1,14 +1,396 @@
+"""Trajectory-policy selection for the multi-turn study.
+
+Two procedures live here.
+
+``search_trajectory_policy_r1`` (revision R1, the paper's description, Sec. 4):
+    selects vartheta = (d_tau_c, d_tau_h, d_tau_q, eta, xi, lambda, k_down, k_up)
+    from a finite candidate set on *calibration (selection-side) trajectories*,
+    with the scorer, risk head and Platt layer fixed. The objective is the
+    paper's operating-point criterion at session level,
+        J = ABR_sess - alpha * FPR_sess   (alpha = 1.0),
+    where a harmful session counts as blocked if any user turn is blocked and
+    a benign session counts as preserved only if every user turn is allowed.
+    Ties: max J, then max ABR, then min mean prompt tokens (quarantine
+    terminal), then min L1 norm of the threshold offsets, then enumeration
+    order. The caller supplies the selection side (seed-cluster split, see
+    rcdp_guard.multiturn.split_by_cluster); nothing here sees evaluation data.
+    The candidate is evaluated with use_trajectory_features=False, i.e. the
+    routing risk is min(1, r_t + eta*rho_{t-1} + xi*max(0, r_t - r_{t-1}))
+    and rho_t = lambda*rho_{t-1} + max(0, r_t - tau_c), the paper's equations.
+
+``search_trajectory_policy`` / ``replay_summary`` / ``split_examples_by_id``
+(legacy, unchanged): the submitted procedure. It differs from the paper in
+(i) the split: ord-sum of the *session* id mod 100 < 67 (sessions of one seed
+fall on both sides); (ii) the objective: ABR + 0.2*BAR - 0.002*tokens on
+turn-level rates; (iii) the candidate set: 10 knobs including
+use_trajectory_features=True (dynamic threshold lowering, 0.45*rho gain and a
+4-state-only escalation rule that the paper does not describe), and a
+trajectory_decay that is ignored whenever use_risk_memory=True; (iv) the
+replay never decays the history counters (not faithful when history_decay=1).
+Kept only so the submitted numbers stay reproducible.
+
+``replay_session`` is a faithful re-implementation of the routing part of
+RCDPController.evaluate_example given per-turn calibrated probabilities (which
+do not depend on the controller state, because the calibration features that
+depend on it are always zero in the single-turn fit). Runners must check it
+against the controller (scripts/run_multiturn_cases.py does, for every
+variant and every session).
+"""
 from __future__ import annotations
 
 from dataclasses import replace
 from itertools import product
-from typing import Any
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from .controller import ControllerConfig, ControllerState, select_controller_state
+from .controller import ControllerConfig, ControllerState, _rank, select_controller_state
+
+_Q = ControllerState.QUARANTINE
+_H = ControllerState.HARDENED
+_C = ControllerState.CAUTIOUS
+
+# ---------------------------------------------------------------------------
+# Faithful replay (revision R1)
+# ---------------------------------------------------------------------------
+
+
+def block_key(num_states: int) -> str:
+    """Threshold that blocks in select_controller_state (2-state: tau_h, else tau_q)."""
+    return "tau_h" if num_states == 2 else "tau_q"
+
+
+def check_replay_supported(config: ControllerConfig) -> None:
+    if config.use_terminal_semantic_review:
+        raise ValueError("replay does not support use_terminal_semantic_review (needs a second scorer)")
+    if config.use_learned_transition_policy:
+        raise ValueError("replay does not support use_learned_transition_policy")
+
+
+def replay_session(
+    probs: Sequence[float],
+    config: ControllerConfig,
+    thresholds: Dict[str, float],
+    *,
+    stop_at_block: bool = False,
+) -> List[tuple]:
+    """Route one dialogue from its per-user-turn calibrated probabilities.
+
+    Returns one tuple (state, decision, effective_risk, risk_memory_before_turn)
+    per routed user turn; with ``stop_at_block`` routing stops after the first
+    blocked turn (quarantine is terminal for the session).
+    """
+    out: List[tuple] = []
+    tau_c = thresholds["tau_c"]
+    prior_state: Optional[ControllerState] = None
+    prior_high = 0
+    prior_caut = 0
+    risk_memory = 0.0
+    safe_streak = 0
+    risky_streak = 0
+    latched = False
+    prev_p = 0.0
+    has_prev = False
+    total = len(probs) or 1
+    traj = config.use_trajectory_features
+    decay_counters = config.allow_state_downgrade and config.history_decay > 0
+    latch_rank = _rank(config.hazard_latch_min_state)
+    for i, p in enumerate(probs):
+        if decay_counters:
+            prior_high = max(0, prior_high - config.history_decay)
+            prior_caut = max(0, prior_caut - config.history_decay)
+        uncertainty = 1.0 - abs(2 * p - 1.0)
+        ref = prev_p if (has_prev or config.legacy_first_turn_trend) else p
+        trend = p - ref
+        eff = p
+        pressure = max(0.0, p - tau_c)
+        if config.use_risk_memory:
+            eff = min(1.0, p + config.risk_memory_gain * risk_memory)
+        if config.risk_trend_gain:
+            eff = min(1.0, eff + config.risk_trend_gain * max(0.0, trend))
+        if traj:
+            eff = min(
+                1.0,
+                eff
+                + config.trajectory_gain * risk_memory
+                + config.trajectory_trend_gain * max(0.0, trend)
+                - 0.05 * max(0, safe_streak - 1),
+            )
+        state = select_controller_state(
+            calibrated=eff,
+            uncertainty=uncertainty,
+            prior_state=prior_state,
+            history_flag=prior_high > 0,
+            safe_streak=safe_streak,
+            risky_streak=risky_streak,
+            config=config,
+            dialogue_progress=(i / max(total - 1, 1)) if traj else 0.0,
+            risk_memory=risk_memory,
+            prev_risk_level=prev_p if (has_prev or config.legacy_first_turn_trend) else eff,
+            transition_score=0.5,
+            thresholds=thresholds,
+        )
+        if config.use_hazard_latch and latched:
+            state = _Q
+        decision = "block" if state == _Q else "allow"
+        out.append((state, decision, eff, risk_memory))
+        if decision == "block" and stop_at_block:
+            break
+        if state == _H or state == _Q:
+            prior_high += 1
+        if state == _C:
+            prior_caut += 1
+        if _rank(state) >= latch_rank:
+            latched = True
+        if config.use_risk_memory or traj:
+            decay = config.risk_memory_decay if config.use_risk_memory else config.trajectory_decay
+            risk_memory = decay * risk_memory + pressure
+        else:
+            risk_memory = 0.0
+        if p < tau_c:
+            safe_streak += 1
+            risky_streak = 0
+        else:
+            risky_streak += 1
+            safe_streak = 0
+        prior_state = state
+        prev_p = p
+        has_prev = True
+    return out
+
+
+def session_outcome(routed: Sequence[tuple], config: ControllerConfig) -> Dict[str, Any]:
+    """Session-level outcome under the paper's rule (any blocked turn blocks the session).
+
+    ``tokens_terminal`` counts the state-prompt tokens of the turns up to and
+    including the first block (quarantine is terminal).
+    """
+    tokens = config.state_prompt_tokens
+    first = None
+    for i, r in enumerate(routed):
+        if r[1] == "block":
+            first = i
+            break
+    upto = routed if first is None else routed[: first + 1]
+    return {
+        "blocked": first is not None,
+        "first_block_turn": first,
+        "turns_terminal": len(upto),
+        "tokens_terminal": sum(tokens[r[0]] for r in upto),
+        "reached_hq": any(r[0] == _H or r[0] == _Q for r in upto),
+    }
+
+
+def replay_outcomes(
+    sessions: Sequence[Dict[str, Any]],
+    probs: Sequence[Sequence[float]],
+    config: ControllerConfig,
+    thresholds_fn: Callable[[str], Dict[str, float]],
+    *,
+    indices: Optional[Iterable[int]] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """Outcomes of ``sessions[i]`` (benchmark taken from the session) for i in ``indices``."""
+    check_replay_supported(config)
+    idx = range(len(sessions)) if indices is None else indices
+    out = {}
+    for i in idx:
+        th = thresholds_fn(sessions[i]["benchmark"])
+        out[i] = session_outcome(replay_session(probs[i], config, th, stop_at_block=True), config)
+    return out
+
+
+def summarize_outcomes(sessions: Sequence[Dict[str, Any]], outcomes: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    nh = bh = nb = ab = 0
+    tok = turns = 0
+    for i, o in outcomes.items():
+        if sessions[i]["label"] == "harmful":
+            nh += 1
+            bh += int(o["blocked"])
+        else:
+            nb += 1
+            ab += int(not o["blocked"])
+        tok += o["tokens_terminal"]
+        turns += o["turns_terminal"]
+    abr = bh / nh if nh else None
+    bar = ab / nb if nb else None
+    return {
+        "n_harmful": nh, "blocked_harmful": bh, "abr": abr,
+        "n_benign": nb, "allowed_benign": ab, "bar": bar,
+        "fpr": (1.0 - bar) if bar is not None else None,
+        "mean_prompt_tokens_terminal": tok / turns if turns else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Threshold families
+# ---------------------------------------------------------------------------
+
+
+def shift_block_threshold(th: Dict[str, float], delta: float, bkey: str) -> Dict[str, float]:
+    """Move the blocking threshold by ``delta`` (clipped to [0, 1]) and rescale the
+    non-blocking ones by the same factor (the ratio rule of the calibration
+    protocol). tau_u is unchanged. delta == 0 returns the thresholds unchanged."""
+    if delta == 0:
+        return dict(th)
+    base = th[bkey]
+    tau = min(1.0, max(0.0, round(base + delta, 6)))
+    if base > 0:
+        scale = tau / base
+        out = {k: (min(1.0, v * scale) if k in ("tau_c", "tau_h", "tau_q") else v) for k, v in th.items()}
+    else:  # degenerate base: fall back to the default ratios
+        from .calibration_protocol import thresholds_for_block
+
+        out = thresholds_for_block(tau, bkey)
+        out["tau_u"] = th.get("tau_u", out["tau_u"])
+    out[bkey] = tau
+    return out
+
+
+def offset_thresholds(th: Dict[str, float], d_c: float, d_h: float, d_q: float) -> Dict[str, float]:
+    clip = lambda x: min(1.0, max(0.0, x))  # noqa: E731
+    out = dict(th)
+    out["tau_c"] = clip(th["tau_c"] + d_c)
+    out["tau_h"] = clip(th["tau_h"] + d_h)
+    out["tau_q"] = clip(th["tau_q"] + d_q)
+    return out
+
+
+def thresholds_function(config: ControllerConfig) -> Callable[[str], Dict[str, float]]:
+    """Frozen copy of config.thresholds_for (later edits of config do not leak in)."""
+    frozen = replace(
+        config,
+        thresholds=dict(config.thresholds),
+        benchmark_thresholds=(
+            {k: dict(v) for k, v in config.benchmark_thresholds.items()}
+            if config.benchmark_thresholds else None
+        ),
+    )
+    return frozen.thresholds_for
+
+
+# ---------------------------------------------------------------------------
+# Paper-aligned trajectory-policy search (revision R1)
+# ---------------------------------------------------------------------------
+
+POLICY_SPACE_R1 = {
+    # threshold offsets relative to the single-turn operating point (as in the submitted grid)
+    "d_tau_c": [-0.08, -0.05, -0.03, 0.0],
+    "d_tau_h": [-0.08, -0.05, -0.03, 0.0],
+    "d_tau_q": [-0.10, -0.07, -0.04, 0.0],
+    "eta": [0.0, 0.25, 0.50, 0.90],      # memory gain (0 = memory off); paper default 0.90
+    "xi": [0.0, 0.10, 0.18, 0.26],       # trend gain
+    "lam": [0.62, 0.72, 0.80, 0.82],     # memory decay; paper default 0.80
+    "k_down": [1, 2],                    # safe streak before a downgrade; paper default 2
+    "k_up": [1, 2],                      # risky streak before an escalation
+}
+POLICY_SPACE_SMALL = {
+    "d_tau_c": [-0.05, 0.0],
+    "d_tau_h": [0.0],
+    "d_tau_q": [-0.07, 0.0],
+    "eta": [0.0, 0.90],
+    "xi": [0.0, 0.18],
+    "lam": [0.80],
+    "k_down": [2],
+    "k_up": [2],
+}
+POLICY_KEYS = ("d_tau_c", "d_tau_h", "d_tau_q", "eta", "xi", "lam", "k_down", "k_up")
+R1_OBJECTIVE = "J = ABR_sess - alpha * FPR_sess on selection-side sessions (any-turn-block rule)"
+R1_TIE_BREAK = ("max J; then max ABR; then min mean prompt tokens (quarantine terminal); "
+                "then min |d_tau_c|+|d_tau_h|+|d_tau_q|; then enumeration order")
+
+
+def policy_candidates(space: Dict[str, Sequence[Any]]) -> List[Dict[str, Any]]:
+    """Enumerate the grid; with eta == 0 the decay is irrelevant, so only its first value is kept."""
+    missing = [k for k in POLICY_KEYS if k not in space]
+    if missing:
+        raise ValueError(f"policy space lacks {missing}")
+    out = []
+    for values in product(*(space[k] for k in POLICY_KEYS)):
+        cand = dict(zip(POLICY_KEYS, values))
+        if cand["eta"] == 0 and cand["lam"] != space["lam"][0]:
+            continue
+        out.append(cand)
+    return out
+
+
+def candidate_config(base: ControllerConfig, cand: Dict[str, Any]) -> ControllerConfig:
+    return replace(
+        base,
+        num_states=4,
+        use_trajectory_features=False,
+        use_learned_transition_policy=False,
+        use_risk_memory=cand["eta"] > 0,
+        risk_memory_gain=float(cand["eta"]),
+        risk_trend_gain=float(cand["xi"]),
+        risk_memory_decay=float(cand["lam"]),
+        safe_streak_to_downgrade=int(cand["k_down"]),
+        risky_streak_to_escalate=int(cand["k_up"]),
+    )
+
+
+def candidate_thresholds_fn(base_fn: Callable[[str], Dict[str, float]], cand: Dict[str, Any]):
+    cache: Dict[str, Dict[str, float]] = {}
+
+    def fn(bench: str) -> Dict[str, float]:
+        if bench not in cache:
+            cache[bench] = offset_thresholds(base_fn(bench), cand["d_tau_c"], cand["d_tau_h"], cand["d_tau_q"])
+        return cache[bench]
+
+    return fn
+
+
+def search_trajectory_policy_r1(
+    sessions: Sequence[Dict[str, Any]],
+    probs: Sequence[Sequence[float]],
+    selection_indices: Sequence[int],
+    base_config: ControllerConfig,
+    base_thresholds_fn: Callable[[str], Dict[str, float]],
+    *,
+    space: Optional[Dict[str, Sequence[Any]]] = None,
+    alpha: float = 1.0,
+    top_k: int = 20,
+) -> Dict[str, Any]:
+    space = space or POLICY_SPACE_R1
+    cands = policy_candidates(space)
+    if not cands:
+        raise ValueError("empty policy space")
+    sel = list(selection_indices)
+    if not any(sessions[i]["label"] == "harmful" for i in sel) or not any(sessions[i]["label"] == "benign" for i in sel):
+        raise ValueError("selection side needs harmful and benign sessions")
+    scored = []
+    for order, cand in enumerate(cands):
+        cfg = candidate_config(base_config, cand)
+        summ = summarize_outcomes(sessions, replay_outcomes(sessions, probs, cfg, candidate_thresholds_fn(base_thresholds_fn, cand), indices=sel))
+        j = summ["abr"] - alpha * summ["fpr"]
+        l1 = abs(cand["d_tau_c"]) + abs(cand["d_tau_h"]) + abs(cand["d_tau_q"])
+        key = (round(j, 12), round(summ["abr"], 12), -round(summ["mean_prompt_tokens_terminal"], 12), -round(l1, 12), -order)
+        scored.append((key, cand, summ, j))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_key, best, best_summ, best_j = scored[0]
+    n_tied_j = sum(1 for s in scored if s[0][0] == best_key[0])
+    n_tied_j_abr = sum(1 for s in scored if s[0][:2] == best_key[:2])
+    return {
+        "procedure": "r1 (paper Sec. 4: finite candidate set on calibration trajectories; scorer, head and Platt fixed)",
+        "objective": R1_OBJECTIVE,
+        "alpha": alpha,
+        "tie_break": R1_TIE_BREAK,
+        "space": {k: list(space[k]) for k in POLICY_KEYS},
+        "n_candidates": len(cands),
+        "n_selection_sessions": len(sel),
+        "best": dict(best),
+        "best_J": best_j,
+        "best_selection_summary": best_summ,
+        "n_tied_at_best_J": n_tied_j,
+        "n_tied_at_best_J_and_ABR": n_tied_j_abr,
+        "top": [{"candidate": dict(c), "J": j, "selection": s} for _, c, s, j in scored[:top_k]],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy (submitted) procedure -- unchanged
+# ---------------------------------------------------------------------------
 
 
 def split_examples_by_id(examples: list[dict[str, Any]], ratio: float = 0.67) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Deterministically split dialogue-level records by example id."""
+    """Legacy: deterministically split dialogue-level records by example id (ord-sum mod 100)."""
     train: list[dict[str, Any]] = []
     test: list[dict[str, Any]] = []
     for ex in examples:
@@ -18,6 +400,7 @@ def split_examples_by_id(examples: list[dict[str, Any]], ratio: float = 0.67) ->
 
 
 def replay_summary(examples: list[dict[str, Any]], config: ControllerConfig) -> dict[str, Any]:
+    """Legacy replay (turn-level metrics; history counters never decay)."""
     records: list[dict[str, Any]] = []
 
     for ex in examples:
@@ -104,6 +487,7 @@ def search_trajectory_policy(
     *,
     train_ratio: float = 0.67,
 ) -> dict[str, Any]:
+    """Legacy (submitted) search; see the module docstring for how it differs from the paper."""
     train_examples, test_examples = split_examples_by_id(examples, ratio=train_ratio)
     search_space = {
         "tau_c_offset": [-0.08, -0.05, -0.03, 0.0],

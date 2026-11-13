@@ -118,8 +118,12 @@ def fit_pair(args: argparse.Namespace):
     )
     patched.terminal_review_scorer = review_scorer
     fit_calibrator(baseline, calibration)
-    # Share the exact learned calibrator so only the defense change differs.
-    patched.calibrator.weights = deepcopy(baseline.calibrator.weights)
+    # Share the exact fitted calibration (head, Platt layer and operating
+    # point) so only the defense change differs.
+    patched.calibrator = deepcopy(baseline.calibrator)
+    patched.config.thresholds = dict(baseline.config.thresholds)
+    patched.config.benchmark_thresholds = deepcopy(baseline.config.benchmark_thresholds)
+    patched.config.legacy_first_turn_trend = baseline.config.legacy_first_turn_trend
     return baseline, patched
 
 

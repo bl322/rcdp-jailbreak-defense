@@ -18,6 +18,9 @@ class ControllerState(str, Enum):
     QUARANTINE = "quarantine"
 
 
+MULTITURN_BENCHMARK_SUFFIX = "-multiturn"
+
+
 @dataclass
 class ControllerConfig:
     num_states: int = 4
@@ -34,6 +37,18 @@ class ControllerConfig:
     transformation_min_confidence: float = 0.80
     risk_memory_decay: float = 0.80
     risk_memory_gain: float = 0.35
+    # Trend gain xi of the paper's trajectory-policy configuration: adds
+    # xi * max(0, r_t - r_{t-1}) to the routing risk. 0.0 (default) leaves the
+    # controller unchanged. Independent of use_trajectory_features, whose own
+    # trend term is trajectory_trend_gain.
+    risk_trend_gain: float = 0.0
+    # True restricts the 2-state variant to {Normal, Quarantine} and the 3-state
+    # variant to {Normal, Cautious, Quarantine}, as the paper defines them: the
+    # streak/history rules may then not introduce a state outside the set (in
+    # particular the safe-streak rule can no longer turn a 2-state block into
+    # Hardened). False (default) keeps the submitted behaviour. Single-turn
+    # routing is identical under both settings.
+    closed_state_set: bool = False
     trajectory_decay: float = 0.72
     trajectory_gain: float = 0.45
     trajectory_trend_gain: float = 0.18
@@ -59,6 +74,14 @@ class ControllerConfig:
             "tau_u": 0.28,
         }
     )
+    # Per-benchmark overrides of ``thresholds`` (benchmark-aware operating
+    # points); benchmarks without an entry use ``thresholds``.
+    benchmark_thresholds: dict[str, dict[str, float]] | None = None
+    # The submitted runs measured the turn-1 "trend" against a previous risk of
+    # 0, which boosted every first turn (single-turn block at r >= 0.6911
+    # instead of tau_q). True reproduces that behaviour; False (revision R1)
+    # gives turn 1 a zero trend.
+    legacy_first_turn_trend: bool = False
     state_prompt_tokens: dict[ControllerState, int] = field(
         default_factory=lambda: {
             ControllerState.NORMAL: 6,
@@ -67,6 +90,17 @@ class ControllerConfig:
             ControllerState.QUARANTINE: 18,
         }
     )
+
+    def thresholds_for(self, benchmark: str | None) -> dict[str, float]:
+        if self.benchmark_thresholds and benchmark:
+            key = benchmark.strip().lower()
+            if key not in self.benchmark_thresholds and key.endswith(MULTITURN_BENCHMARK_SUFFIX):
+                # Dialogues generated with the submitted naming ("HarmBench-multiturn")
+                # use the operating point of their seed benchmark.
+                key = key[: -len(MULTITURN_BENCHMARK_SUFFIX)]
+            if key in self.benchmark_thresholds:
+                return self.benchmark_thresholds[key]
+        return self.thresholds
 
 
 class RCDPController:
@@ -114,7 +148,12 @@ class RCDPController:
             feature_config=self.feature_config,
         )
         prob = self.calibrator.predict_proba(features)
-        return CalibrationResult(probability=prob, features=features)
+        head_logit = (
+            self.calibrator.decision_function(features)
+            if hasattr(self.calibrator, "decision_function")
+            else None
+        )
+        return CalibrationResult(probability=prob, features=features, head_logit=head_logit)
 
     def select_state(
         self,
@@ -128,6 +167,7 @@ class RCDPController:
         risk_memory: float = 0.0,
         prev_risk_level: float = 0.0,
         transition_score: float = 0.5,
+        thresholds: dict[str, float] | None = None,
     ) -> ControllerState:
         return select_controller_state(
             calibrated=calibrated,
@@ -141,6 +181,7 @@ class RCDPController:
             risk_memory=risk_memory,
             prev_risk_level=prev_risk_level,
             transition_score=transition_score,
+            thresholds=thresholds,
         )
 
     def evaluate_example(self, example: Example) -> list[EvalRecord]:
@@ -155,6 +196,8 @@ class RCDPController:
         risky_streak = 0
         hazard_latched = False
         prev_calibrated = 0.0
+        has_prev_turn = False
+        thresholds = self.config.thresholds_for(example.benchmark)
         peak_effective_risk = 0.0
         peak_raw_score = 0.0
         user_turn_index = 0
@@ -200,9 +243,14 @@ class RCDPController:
                 risky_streak=risky_streak,
             )
             uncertainty = 1.0 - abs(2 * calibrated.probability - 1.0)
-            trend = calibrated.probability - prev_calibrated
+            trend_reference = (
+                prev_calibrated
+                if has_prev_turn or self.config.legacy_first_turn_trend
+                else calibrated.probability
+            )
+            trend = calibrated.probability - trend_reference
             effective_risk = calibrated.probability
-            pressure = max(0.0, calibrated.probability - self.config.thresholds["tau_c"])
+            pressure = max(0.0, calibrated.probability - thresholds["tau_c"])
             transition_features = build_transition_features(
                 raw_score=score_result.raw_score,
                 calibrated_score=calibrated.probability,
@@ -228,6 +276,12 @@ class RCDPController:
                     1.0,
                     calibrated.probability
                     + self.config.risk_memory_gain * risk_memory,
+                )
+
+            if self.config.risk_trend_gain:
+                effective_risk = min(
+                    1.0,
+                    effective_risk + self.config.risk_trend_gain * max(0.0, trend),
                 )
 
             if self.config.use_trajectory_features:
@@ -272,8 +326,13 @@ class RCDPController:
                 risky_streak=risky_streak,
                 dialogue_progress=(user_turn_index / max(total_user_turns - 1, 1)) if self.config.use_trajectory_features else 0.0,
                 risk_memory=risk_memory,
-                prev_risk_level=prev_calibrated,
+                prev_risk_level=(
+                    prev_calibrated
+                    if has_prev_turn or self.config.legacy_first_turn_trend
+                    else effective_risk
+                ),
                 transition_score=transition_score,
+                thresholds=thresholds,
             )
             if terminal_review_triggered:
                 # A softened final turn must not erase harmful intent established
@@ -307,6 +366,7 @@ class RCDPController:
                         "reasons": score_result.reasons,
                         "risk_views": view_scores,
                         "features": calibrated.features,
+                        "head_logit": calibrated.head_logit,
                         "effective_risk": effective_risk,
                         "risk_memory": risk_memory,
                         "safe_streak": safe_streak,
@@ -344,7 +404,7 @@ class RCDPController:
             else:
                 risk_memory = 0.0
 
-            if calibrated.probability < self.config.thresholds["tau_c"]:
+            if calibrated.probability < thresholds["tau_c"]:
                 safe_streak += 1
                 risky_streak = 0
             else:
@@ -353,6 +413,7 @@ class RCDPController:
 
             prior_state = state
             prev_calibrated = calibrated.probability
+            has_prev_turn = True
             peak_effective_risk = max(peak_effective_risk, effective_risk)
             peak_raw_score = max(peak_raw_score, score_result.raw_score)
             user_turn_index += 1
@@ -466,11 +527,13 @@ def select_controller_state(
     risk_memory: float = 0.0,
     prev_risk_level: float = 0.0,
     transition_score: float = 0.5,
+    thresholds: dict[str, float] | None = None,
 ) -> ControllerState:
-    tau_c = config.thresholds["tau_c"]
-    tau_h = config.thresholds["tau_h"]
-    tau_q = config.thresholds["tau_q"]
-    tau_u = config.thresholds["tau_u"]
+    th = thresholds if thresholds is not None else config.thresholds
+    tau_c = th["tau_c"]
+    tau_h = th["tau_h"]
+    tau_q = th["tau_q"]
+    tau_u = th["tau_u"]
 
     if config.use_trajectory_features:
         progress = min(max(dialogue_progress, 0.0), 1.0)
@@ -505,10 +568,17 @@ def select_controller_state(
         else:
             state = ControllerState.NORMAL
 
+    # closed_state_set: the 2-state variant never leaves {N, Q} and the 3-state
+    # variant never enters Hardened (see ControllerConfig.closed_state_set).
+    closed = config.closed_state_set and config.num_states in (2, 3)
+    allow_cautious = not (closed and config.num_states == 2)
+    allow_hardened = not closed
+
     if risky_streak >= config.risky_streak_to_escalate:
         if state == ControllerState.NORMAL:
-            state = ControllerState.CAUTIOUS
-        elif state == ControllerState.CAUTIOUS and calibrated >= tau_h:
+            if allow_cautious:
+                state = ControllerState.CAUTIOUS
+        elif state == ControllerState.CAUTIOUS and calibrated >= tau_h and allow_hardened:
             state = ControllerState.HARDENED
 
     if config.use_trajectory_features and config.num_states == 4:
@@ -521,15 +591,25 @@ def select_controller_state(
         ):
             state = ControllerState.QUARANTINE
 
+    # Note: this safe-streak rule acts on the current turn in both the monotone
+    # and the downgrade-enabled controller; allow_state_downgrade only decides
+    # whether the result may fall below the previous turn's state (clamp below).
     if safe_streak >= config.safe_streak_to_downgrade and state != ControllerState.NORMAL:
         if state == ControllerState.QUARANTINE and calibrated < tau_q:
-            state = ControllerState.HARDENED
+            if allow_hardened:
+                state = ControllerState.HARDENED
         elif state == ControllerState.HARDENED and calibrated < tau_h:
             state = ControllerState.CAUTIOUS
         elif state == ControllerState.CAUTIOUS and calibrated < tau_c:
             state = ControllerState.NORMAL
 
-    if history_flag and config.use_history and state == ControllerState.NORMAL and safe_streak == 0:
+    if (
+        history_flag
+        and config.use_history
+        and state == ControllerState.NORMAL
+        and safe_streak == 0
+        and allow_cautious
+    ):
         state = ControllerState.CAUTIOUS
 
     if (

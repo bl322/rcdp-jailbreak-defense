@@ -36,6 +36,7 @@ class ScoreResult:
 class CalibrationResult:
     probability: float
     features: dict[str, float]
+    head_logit: float | None = None
 
 
 @dataclass
