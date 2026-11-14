@@ -87,6 +87,10 @@ def build_parser():
     g.add_argument("--scorer-device", default="cpu")
     g.add_argument("--scorer-cache-path", default=None)
     g.add_argument("--scorer-cache-only", action="store_true")
+    g.add_argument("--scorer-score-mode", default="label", choices=["label", "prob"],
+                   help="llama-guard scorer only: raw score from the parsed verdict (label, submitted "
+                        "behaviour) or P(unsafe) at the verdict position (prob, revision R1). Ignored by "
+                        "the other scorers.")
     g.add_argument("--state-prompts-file", default=None,
                    help="JSON {normal, cautious, hardened} overriding the submitted state instructions.")
     g.add_argument("--keep-calibration-features", action="store_true")
@@ -112,7 +116,8 @@ def build_scorer(args):
         return KeywordRiskScorer()
     if args.scorer == "llama-guard":
         return LlamaGuardRiskScorer(model_name=args.scorer_model_name, local_files_only=args.scorer_local_files_only,
-                                    device=args.scorer_device, cache_path=args.scorer_cache_path)
+                                    device=args.scorer_device, cache_path=args.scorer_cache_path,
+                                    score_mode=args.scorer_score_mode)
     return DistilBartMNLIRiskScorer(model_name=args.scorer_model_name, local_files_only=args.scorer_local_files_only,
                                     device=args.scorer_device, cache_path=args.scorer_cache_path,
                                     cache_only=args.scorer_cache_only)
@@ -198,6 +203,7 @@ def main(argv=None, overrides=None):
         "controller_scorer": args.scorer,
         "controller_scorer_model": args.scorer_model_name if args.scorer != "keyword" else None,
         "controller_scorer_cache_path": args.scorer_cache_path,
+        "controller_scorer_score_mode": (args.scorer_score_mode if args.scorer == "llama-guard" else None),
         "output_guard": bool(args.output_guard),
         "output_guard_backend": args.output_guard_backend if args.output_guard else None,
         "output_guard_model_path": args.output_guard_model_path if args.output_guard else None,
