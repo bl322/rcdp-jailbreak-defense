@@ -82,7 +82,7 @@ DATA = EXPERIMENTS / "data"
 CALIBRATION = DATA / "paper_splits" / "full_pool_calibration.jsonl"
 LOCAL_LG = str(EXPERIMENTS / "llama-guard-3-1b")
 NLI_MODEL = "valhalla/distilbart-mnli-12-3"
-SCORER_KINDS = ("nli", "ensemble", "keyword")
+SCORER_KINDS = ("nli", "ensemble", "keyword", "llama-guard")
 
 CALIB_CACHE_FORMAT = "rcdp-hardened-calibration/v2"
 
@@ -121,10 +121,14 @@ class EnsembleRiskScorer:
 
 
 def scorer_identity(kind: str, *, device: str = "cpu", nli_model: str = NLI_MODEL,
-                    guard_model: str = None) -> dict:
+                    guard_model: str = None, lg_score_mode: str = "prob") -> dict:
     """What determines the raw scores (part of the calibration cache key)."""
     if kind == "keyword":
         return {"kind": "keyword", "class": "KeywordRiskScorer"}
+    if kind == "llama-guard":
+        # score_mode changes the raw scale itself, so it belongs in the key.
+        return {"kind": kind, "class": "LlamaGuardRiskScorer", "device": device,
+                "guard_model": guard_model or LOCAL_LG, "score_mode": lg_score_mode}
     out = {"kind": kind, "nli_model": nli_model, "device": device}
     if kind == "ensemble":
         out["guard_model"] = guard_model or LOCAL_LG
@@ -134,15 +138,25 @@ def scorer_identity(kind: str, *, device: str = "cpu", nli_model: str = NLI_MODE
 
 def build_scorer(kind: str, *, device: str = "cpu", nli_model: str = NLI_MODEL,
                  guard_model: str = None, torch_threads: int = 16,
-                 local_files_only: bool = True):
+                 local_files_only: bool = True, lg_score_mode: str = "prob"):
     if kind == "keyword":
         # Offline smoke tests only: lexical scorer, no torch.
         return KeywordRiskScorer()
-    if kind not in ("nli", "ensemble"):
+    if kind not in ("nli", "ensemble", "llama-guard"):
         raise ValueError(f"unknown scorer kind: {kind}")
     import torch
 
     torch.set_num_threads(torch_threads)
+    if kind == "llama-guard":
+        # Single Llama-Guard pass, no NLI. Used by the adaptive re-attack on the
+        # Table 3 "Llama-Guard" controller variant.
+        return LlamaGuardRiskScorer(
+            model_name=guard_model or LOCAL_LG,
+            device=device,
+            local_files_only=local_files_only,
+            score_mode=lg_score_mode,
+            cache_path=str(EXPERIMENTS / "cache" / f"llamaguard_tap_probe_{lg_score_mode}_cache.json"),
+        )
     nli = DistilBartMNLIRiskScorer(
         model_name=nli_model, local_files_only=local_files_only, device=device
     )
@@ -285,6 +299,7 @@ def build_controller(
     device: str = "cpu",
     nli_model: str = NLI_MODEL,
     guard_model: str = None,
+    lg_score_mode: str = "prob",
     config: ControllerConfig = None,
     log=print,
 ) -> RCDPController:
@@ -296,7 +311,8 @@ def build_controller(
     protocol, seed, alpha = resolve_calibration(protocol, seed, alpha)
     calibration_path = Path(calibration_path or CALIBRATION)
     if scorer is None:
-        scorer = build_scorer(kind, device=device, nli_model=nli_model, guard_model=guard_model)
+        scorer = build_scorer(kind, device=device, nli_model=nli_model, guard_model=guard_model,
+                              lg_score_mode=lg_score_mode)
     if config is None:
         config = ControllerConfig(benchmark_aware=benchmark_aware)
     if config.use_learned_transition_policy:
@@ -306,7 +322,8 @@ def build_controller(
     controller = RCDPController(scorer=scorer, feature_config=FeatureConfig.all(), config=config)
 
     key = calibration_cache_key(
-        scorer_id=scorer_identity(kind, device=device, nli_model=nli_model, guard_model=guard_model),
+        scorer_id=scorer_identity(kind, device=device, nli_model=nli_model, guard_model=guard_model,
+                                  lg_score_mode=lg_score_mode),
         config=config,
         feature_config=controller.feature_config,
         protocol=protocol,

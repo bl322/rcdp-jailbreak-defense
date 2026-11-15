@@ -459,6 +459,9 @@ def parse_args(argv=None):
     m.add_argument("--output", required=True)
     m.add_argument("--scorer", default="distilbart-mnli", choices=SCORER_KINDS)
     m.add_argument("--scorer-model-name", default=None, help="default per --scorer; a local path for llama-guard")
+    m.add_argument("--scorer-score-mode", default="label", choices=["label", "prob"],
+                   help="llama-guard only: 'label' = submitted verdict rule (raw 0.99/0.01/0.95/0.05/0.50); "
+                        "'prob' = raw score is P(unsafe) at the verdict token (label score kept in metadata)")
     m.add_argument("--device", default="cpu", help="scorer device")
     m.add_argument("--dtype", default=None, help="scorer dtype (default: as loaded; Llama-Guard: bf16 on GPU)")
     m.add_argument("--local-files-only", action="store_true")
@@ -567,7 +570,7 @@ def measure(args, scorer=None, tokenizer=None, alt_classifier=None, argv=None):
     if args.limit:
         examples = examples[: args.limit]
     raw_scorer = scorer or build_scorer(args.scorer, args.scorer_model_name, args.device, args.local_files_only,
-                                        args.dtype)
+                                        args.dtype, score_mode=args.scorer_score_mode)
     clock = Clock(sync)
     timed_scorer = TimedScorer(raw_scorer, clock)
     replay = ReplayScorer()
@@ -834,7 +837,9 @@ def measure(args, scorer=None, tokenizer=None, alt_classifier=None, argv=None):
                 "scorer": {"kind": args.scorer,
                            "name": (Path(str(args.scorer_model_name)).name if args.scorer == "llama-guard"
                                     else args.scorer_model_name),
-                           "device": args.device, "dtype_arg": args.dtype, "model": model_info(raw_scorer)},
+                           "device": args.device, "dtype_arg": args.dtype,
+                           "score_mode_arg": (args.scorer_score_mode if args.scorer == "llama-guard" else None),
+                           "model": model_info(raw_scorer)},
                 "protected": generator_settings(gen), "output_guard": judge_settings(guard),
                 "response_judge": judge_settings(judge),
                 "alt_guard": None if alt is None else {

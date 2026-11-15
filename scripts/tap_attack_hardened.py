@@ -412,6 +412,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--scorer-device", default="cpu")
     g.add_argument("--nli-model", default=NLI_MODEL)
     g.add_argument("--guard-model", default=None, help="Llama-Guard path (default $RCDP_EXPERIMENTS/llama-guard-3-1b)")
+    g.add_argument("--lg-score-mode", default="prob", choices=("label", "prob"),
+                   help="score mode when --scorer llama-guard (default: prob = P(unsafe))")
     g.add_argument("--dataset", default=str(HELDOUT))
     g.add_argument("--calibration-dataset", default=str(CALIBRATION))
     g.add_argument("--calibration-protocol", default=None,
@@ -523,7 +525,8 @@ def build_protocol(args, *, controller, attacker, judge, target) -> dict:
         "scorer": args.scorer,
         "scorer_device": args.scorer_device,
         "nli_model": args.nli_model if args.scorer != "keyword" else None,
-        "guard_model": (args.guard_model or "$RCDP_EXPERIMENTS/llama-guard-3-1b") if args.scorer == "ensemble" else None,
+        "guard_model": (args.guard_model or "$RCDP_EXPERIMENTS/llama-guard-3-1b") if args.scorer in ("ensemble", "llama-guard") else None,
+        "lg_score_mode": args.lg_score_mode if args.scorer == "llama-guard" else None,
         "decision_rule": "block iff controller state is QUARANTINE, or the principal is latched",
         "identity_mode": args.identity,
         "identity_scope": (
@@ -731,6 +734,7 @@ def main(argv=None) -> int:
         device=args.scorer_device,
         nli_model=args.nli_model,
         guard_model=args.guard_model,
+        lg_score_mode=args.lg_score_mode,
         log=log,
     )
     attacker = judge = target = None

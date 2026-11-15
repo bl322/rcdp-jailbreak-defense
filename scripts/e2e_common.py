@@ -307,12 +307,72 @@ def slim_calibration_report(report, keep_features=False):
 
 
 # --------------------------------------------------------------------------- statistics
-def _binom_cdf(k, n, p):
-    if p <= 0:
+def _betacf(a, b, x):
+    """Continued fraction for the incomplete beta function (Numerical Recipes 6.4)."""
+    MAXIT, EPS, FPMIN = 300, 3e-15, 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, MAXIT + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < EPS:
+            break
+    return h
+
+
+def _betai(a, b, x):
+    """Regularized incomplete beta I_x(a, b) (Numerical Recipes 6.4)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
         return 1.0
-    if p >= 1:
-        return 0.0 if k < n else 1.0
-    return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(0, k + 1))
+    lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    front = math.exp(lbeta + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def _binom_cdf(k, n, p):
+    """P(X <= k) for X ~ Binomial(n, p) = I_{1-p}(n-k, k+1), exact, no scipy.
+
+    Formerly a direct sum over math.comb(n, i), which raises OverflowError for
+    n >~ 1000 (OR-Bench hard-1k has n = 1319) and loses precision for small p.
+    """
+    if n <= 0:
+        return 0.0
+    if k < 0:
+        return 0.0
+    if k >= n:
+        return 1.0
+    if p <= 0.0:
+        return 1.0
+    if p >= 1.0:
+        return 0.0
+    return _betai(n - k, k + 1.0, 1.0 - p)
 
 
 def clopper_pearson(k, n, alpha=0.05):

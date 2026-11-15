@@ -151,7 +151,7 @@ def now() -> str:
 # --------------------------------------------------------------------------
 
 def build_scorer(kind: str, model_name: str | None = None, device: str = "cpu", local_files_only: bool = False,
-                 dtype: str | None = None, cache_path: str | None = None):
+                 dtype: str | None = None, cache_path: str | None = None, score_mode: str = "label"):
     """Same scorer classes as the RCDP runs. ``deberta-zeroshot`` is the generic NLI
     scorer class (DistilBartMNLIRiskScorer) loaded with the DeBERTa-v3-large zero-shot checkpoint."""
     from rcdp_guard.scorers import DistilBartMNLIRiskScorer, KeywordRiskScorer, LlamaGuardRiskScorer
@@ -171,7 +171,7 @@ def build_scorer(kind: str, model_name: str | None = None, device: str = "cpu", 
         if not model_name:
             raise ValueError("--scorer llama-guard needs a model path/name")
         return LlamaGuardRiskScorer(model_name=model_name, device=device, local_files_only=local_files_only,
-                                    torch_dtype=dtype, cache_path=cache_path)
+                                    torch_dtype=dtype, cache_path=cache_path, score_mode=score_mode)
     raise ValueError(f"unknown scorer kind {kind!r}; expected one of {SCORER_KINDS}")
 
 
