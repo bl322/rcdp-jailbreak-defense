@@ -461,7 +461,25 @@ class LlamaGuardRiskScorer:
                 "content": [{"type": "text", "text": text}],
             }
         )
-        return messages
+        # Llama Guard's chat template rejects adjacent same-role turns. Under
+        # principal binding the controller stores prior queries only (all user
+        # text, possibly odd length), so the parity-based roles above can leave
+        # a user turn directly before the current one. Merge adjacent same-role
+        # turns: a no-op for alternating histories, and for the all-user case it
+        # keeps the whole context in one user block instead of dropping it.
+        merged: list[dict] = []
+        for message in messages:
+            piece = message["content"][0]["text"]
+            if merged and merged[-1]["role"] == message["role"]:
+                merged[-1]["content"][0]["text"] += "\n\n" + piece
+            else:
+                merged.append({"role": message["role"],
+                               "content": [{"type": "text", "text": piece}]})
+        # The template also requires the conversation to start with a user turn;
+        # a parity-truncated history can begin with an orphan assistant reply.
+        while merged and merged[0]["role"] != "user":
+            merged.pop(0)
+        return merged
 
     def score_trajectory(
         self,
