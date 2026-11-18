@@ -153,7 +153,11 @@ def now() -> str:
 def build_scorer(kind: str, model_name: str | None = None, device: str = "cpu", local_files_only: bool = False,
                  dtype: str | None = None, cache_path: str | None = None, score_mode: str = "label"):
     """Same scorer classes as the RCDP runs. ``deberta-zeroshot`` is the generic NLI
-    scorer class (DistilBartMNLIRiskScorer) loaded with the DeBERTa-v3-large zero-shot checkpoint."""
+    scorer class (DistilBartMNLIRiskScorer) loaded with the DeBERTa-v3-large zero-shot checkpoint.
+    ``score_mode`` applies to ``llama-guard`` only: "label" (verdict, the default and the submitted
+    behaviour) or "prob" (P(unsafe), the scorer of the RCDP Llama-Guard configuration)."""
+    if kind != "llama-guard" and score_mode != "label":
+        raise ValueError(f"score_mode {score_mode!r} applies to the llama-guard scorer only")
     from rcdp_guard.scorers import DistilBartMNLIRiskScorer, KeywordRiskScorer, LlamaGuardRiskScorer
 
     if kind == "keyword":

@@ -1,0 +1,13 @@
+# built by scripts/prepare_data.py
+data/raw/
+data/external/
+data/external_mt/
+data/generated/
+data/paper_splits/*.jsonl
+data/paper_splits/split_summary.json
+# written by reproduce/*.sh
+results/
+# model weights (README, Models)
+llama-guard-3-1b/
+models/
+__pycache__/

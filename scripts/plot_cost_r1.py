@@ -68,6 +68,10 @@ def parse_args(argv=None):
     p.add_argument("--width", type=float, default=6.3, help="inches")
     p.add_argument("--height", type=float, default=3.0, help="inches")
     p.add_argument("--font-size", type=float, default=8.5)
+    p.add_argument("--layout", choices=["full", "compact"], default="full",
+                   help="compact: one row per full path (the scorer-only rows, which differ by the controller "
+                        "stages, stay in the tables), short labels, panel (b) grouped by scorer, and a fixed "
+                        "--width so that the figure is printed at 1:1 (6.5 in = text width of the CMC template)")
     return p.parse_args(argv)
 
 
@@ -97,7 +101,8 @@ def scorer_name(scorer_meta):
     name = str(scorer_meta.get("name") or "")
     if "deberta" in name.lower():
         return SCORER_NAMES["deberta-zeroshot"]
-    return SCORER_NAMES.get(kind, kind or "scorer")
+    base = SCORER_NAMES.get(kind, kind or "scorer")
+    return base + " P(unsafe)" if scorer_meta.get("score_mode") == "prob" else base
 
 
 def sha256_file(path):
@@ -322,6 +327,174 @@ def render(path, latency, bars, args):
     plt.close(fig)
 
 
+SHORT_SCORER = {"DistilBART-MNLI": "DistilBART", "DeBERTa-v3-large": "DeBERTa",
+                "Llama-Guard-3-1B P(unsafe)": "Llama-Guard P(unsafe)", "Llama-Guard-3-1B": "Llama-Guard"}
+
+
+def compact_rows(latency):
+    """Rows of the compact panel (a), top to bottom: (label, [latency records])."""
+    rows = []
+
+    def add(label, recs):
+        if recs:
+            rows.append((label, recs))
+
+    add("Static prompt patch", [r for r in latency if r["key"] == "static"])
+    add("RCDP controller stages", [r for r in latency if r["key"] == "routing"])
+    scorers = []
+    for r in latency:
+        if r["key"] == "rcdp_path":
+            s = r["row"].split(": ", 1)[1]
+            if s not in scorers:
+                scorers.append(s)
+    for s in scorers:
+        add("RCDP path, " + SHORT_SCORER.get(s, s), [r for r in latency if r["key"] == "rcdp_path" and r["row"].endswith(s)])
+    add("Llama-Guard one-shot verdict", [r for r in latency if r["key"] == "oneshot"])
+    sm = [r for r in latency if r["key"] == "smoothllm"]
+    add(sm[0]["row"].replace("SmoothLLM-style + LG", "SmoothLLM-style vote") if sm else "", sm)
+    add("Hardened output check", [r for r in latency if r["key"] == "output_guard"])
+    return rows
+
+
+def compact_tokens(tokens, measure):
+    """Panel (b) of the compact layout: static instruction once, then (all requests, generated) per scorer."""
+    key_all, key_gen, key_static = (
+        ("hidden_prompt_tokens_mean_all_requests", "hidden_prompt_tokens_mean_generated", "hidden_prompt_tokens_mean")
+        if measure == "hidden" else
+        ("added_input_tokens_mean_all_requests", "added_input_tokens_mean_generated", "added_input_tokens_mean"))
+    statics = {round(t["static_patch"][key_static], 6) for t in tokens if t["static_patch"].get(key_static) is not None}
+    if len(statics) > 1:
+        raise SystemExit(f"static-instruction token counts differ between inputs: {sorted(statics)}")
+    groups = [("Static instruction", None, statics.pop() if statics else None)]
+    for t in tokens:
+        groups.append((SHORT_SCORER.get(t["scorer"], t["scorer"]), t["rcdp"].get(key_all), t["rcdp"].get(key_gen)))
+    return groups
+
+
+def render_compact(path, latency, tokens, args):
+    import math
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    fs = args.font_size
+    small = fs - 0.5
+    plt.rcParams.update({"font.size": fs, "axes.edgecolor": INK_2, "axes.labelcolor": INK, "xtick.color": INK_2,
+                         "ytick.color": INK, "text.color": INK, "pdf.fonttype": 42, "ps.fonttype": 42,
+                         "font.family": "DejaVu Sans", "axes.linewidth": 0.6, "xtick.major.width": 0.6,
+                         "xtick.labelsize": fs, "ytick.labelsize": fs, "legend.fontsize": small})
+    devices = []
+    for r in latency:
+        if r["device"] not in devices:
+            devices.append(r["device"])
+    style = {d: (SLOTS[i % len(SLOTS)], MARKERS[i % len(MARKERS)]) for i, d in enumerate(devices)}
+    rows = compact_rows(latency)
+    groups = compact_tokens(tokens, args.token_measure) if tokens else []
+
+    W, H = args.width, args.height
+    fig = plt.figure(figsize=(W, H))
+
+    def box(x0, y0, w, h):  # inches -> figure fractions; no tight bbox, so the saved size is exactly W x H
+        return [x0 / W, y0 / H, w / W, h / H]
+
+    bottom, top = 0.8, 0.2
+    a_x0 = 1.78
+    a_w = (4.18 - a_x0) if groups else (W - a_x0 - 0.05)
+    ax = fig.add_axes(box(a_x0, bottom, a_w, H - bottom - top))
+    n = len(rows)
+    vals = [v for _, recs in rows for r in recs for v in (r[args.stat], r["mean_ci95_lo"], r["mean_ci95_hi"],
+                                                           r["p50"], r["p99"]) if v is not None and v > 0]
+    lo_lim, hi_lim = min(vals) / 3.0, max(vals) * 6.0
+    ax.set_xscale("log")
+    ax.set_xlim(lo_lim, hi_lim)
+    pt_per_decade = a_w * 72.0 / (math.log10(hi_lim) - math.log10(lo_lim))
+    for i, (label, recs) in enumerate(rows):
+        y0 = n - 1 - i
+        for k, r in enumerate(recs):
+            m = len(recs)
+            y = y0 + (0.0 if m == 1 else (0.2 - 0.4 * k / (m - 1)))
+            color, marker = style[r["device"]]
+            x = r[args.stat]
+            lo, hi = ((r["mean_ci95_lo"], r["mean_ci95_hi"]) if args.stat == "mean" else
+                      (r["p50_ci95_lo"], r["p50_ci95_hi"]))
+            ax.plot([r["p50"], r["p99"]], [y, y], color=color, lw=0.9, alpha=0.45, solid_capstyle="round", zorder=2)
+            ax.plot([r["p99"]], [y], marker="|", color=color, ms=4.0, mew=0.9, alpha=0.8, zorder=2)
+            if lo is not None and hi is not None:
+                ax.errorbar([x], [y], xerr=[[max(x - lo, 0.0)], [max(hi - x, 0.0)]], fmt="none", ecolor=color,
+                            elinewidth=1.0, capsize=1.8, zorder=3)
+            ax.plot([x], [y], marker=marker, ms=4.2, color=color, mec="white", mew=0.5, zorder=4)
+            text = fmt_ms(x)
+            text_dec = len(text) * small * 0.56 / pt_per_decade  # label width in decades
+            right = max(v for v in (x, hi, r["p99"]) if v is not None)
+            left = min(v for v in (x, lo, r["p50"]) if v is not None and v > 0)
+            if math.log10(right * 1.4) + text_dec < math.log10(hi_lim):
+                ax.text(right * 1.4, y, text, va="center", ha="left", fontsize=small, color=INK_2)
+            else:  # no room on the right: label to the left of the interval
+                ax.text(left / 1.4, y, text, va="center", ha="right", fontsize=small, color=INK_2)
+    ax.set_yticks([n - 1 - i for i in range(n)])
+    ax.set_yticklabels([lab for lab, _ in rows])
+    ax.set_ylim(-0.55, n - 0.45)
+    ax.set_xlabel("ms per request (log scale)", labelpad=1.0)
+    ax.set_title("(a) Per-request latency, batch size 1", loc="left", fontsize=fs, pad=3)
+    ax.grid(axis="x", color=GRID, lw=0.5)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="y", length=0, pad=2)
+    ax.tick_params(axis="x", pad=1.5)
+    handles = [Line2D([], [], color=style[d][0], marker=style[d][1], ls="", ms=4.2, mec="white", label=d)
+               for d in devices]
+    handles.append(Line2D([], [], color=INK_2, lw=0.9, alpha=0.5, marker="|", ms=4.0,
+                          label=f"{'mean' if args.stat == 'mean' else 'p50'}, 95% CI; line p50 to p99"))
+    fig.legend(handles=handles, loc="lower left", ncol=1 if groups else len(handles), frameon=False,
+               bbox_to_anchor=(0.0, 0.0) if not groups else (0.0, -0.01), handletextpad=0.3,
+               columnspacing=1.0, borderaxespad=0.1, labelspacing=0.1)
+    if groups:
+        # with panel (b) the device legend is stacked at the lower left, under the y labels of panel (a)
+        ax.set_position(box(a_x0, bottom, a_w, H - bottom - top))
+
+    if groups:
+        tok_colors = (SLOTS[len(devices) % len(SLOTS)], SLOTS[(len(devices) + 1) % len(SLOTS)])
+        b_x0 = 5.02
+        bx = fig.add_axes(box(b_x0, bottom, W - b_x0 - 0.04, H - bottom - top))
+        g = len(groups)
+        vmax = max(v for _, a, b in groups for v in (a, b) if v is not None)
+        for i, (label, v_all, v_gen) in enumerate(groups):
+            y0 = g - 1 - i
+            if v_all is None:  # static instruction: the same tokens on every request
+                bx.barh([y0], [v_gen], height=0.42, color=GRID, edgecolor=INK_2, lw=0.5)
+                bx.text(v_gen, y0, f" {v_gen:.1f}", va="center", ha="left", fontsize=small, color=INK_2)
+                continue
+            for j, (v, c) in enumerate(((v_all, tok_colors[0]), (v_gen, tok_colors[1]))):
+                y = y0 + (0.17 if j == 0 else -0.17)
+                bx.barh([y], [v], height=0.32, color=c, edgecolor="white", lw=0.6)
+                bx.text(v, y, f" {v:.1f}", va="center", ha="left", fontsize=small, color=INK_2)
+        bx.set_yticks([g - 1 - i for i in range(g)])
+        bx.set_yticklabels([lab.replace(" P(unsafe)", "") .replace("Static instruction", "Static") for lab, _, _ in groups])
+        bx.set_xlim(0, vmax * 1.3)
+        bx.set_ylim(-0.55, g - 0.45)
+        bx.set_xlabel("tokens per request", labelpad=1.0)
+        bx.set_title("(b) Hidden instruction" if args.token_measure == "hidden" else "(b) Added input tokens",
+                     loc="left", fontsize=fs, pad=3)
+        bx.grid(axis="x", color=GRID, lw=0.5)
+        bx.set_axisbelow(True)
+        for side in ("top", "right"):
+            bx.spines[side].set_visible(False)
+        bx.tick_params(axis="y", length=0, pad=2)
+        bx.tick_params(axis="x", pad=1.5)
+        fig.legend(handles=[Patch(color=tok_colors[0], label="RCDP, all requests"),
+                            Patch(color=tok_colors[1], label="RCDP, sent to the model"),
+                            Patch(facecolor=GRID, edgecolor=INK_2, lw=0.5, label="static, every request")],
+                   loc="lower left", bbox_to_anchor=((b_x0 - 0.78) / W, -0.01), ncol=1, frameon=False,
+                   handlelength=1.0, handletextpad=0.3, labelspacing=0.1, borderaxespad=0.1)
+    fig.savefig(path, pad_inches=0.0)
+    plt.close(fig)
+
+
 def main(argv=None):
     args = parse_args(argv)
     overrides = {}
@@ -351,7 +524,10 @@ def main(argv=None):
     except ImportError:
         print("matplotlib is not installed: figure skipped (tables written)")
         return 0
-    render(out, latency, bars, args)
+    if args.layout == "compact":
+        render_compact(out, latency, tokens, args)
+    else:
+        render(out, latency, bars, args)
     print("wrote", out)
     return 0
 

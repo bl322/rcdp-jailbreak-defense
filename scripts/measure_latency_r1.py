@@ -334,7 +334,8 @@ def build_alt_classifier(args, raw_scorer, devices):
     device = args.alt_guard_device or args.device
     devices.add(device)
     same = (args.scorer == "llama-guard" and str(args.scorer_model_name) == str(path) and args.device == device
-            and (args.alt_guard_dtype or None) == (args.dtype or None))
+            and (args.alt_guard_dtype or None) == (args.dtype or None)
+            and getattr(args, "scorer_score_mode", "label") == "label")
     lg = raw_scorer if same else build_scorer("llama-guard", path, device, args.local_files_only,
                                               args.alt_guard_dtype)
     return E.LlamaGuardPromptClassifier(model_path=path, device=device, scorer=lg)
@@ -460,8 +461,8 @@ def parse_args(argv=None):
     m.add_argument("--scorer", default="distilbart-mnli", choices=SCORER_KINDS)
     m.add_argument("--scorer-model-name", default=None, help="default per --scorer; a local path for llama-guard")
     m.add_argument("--scorer-score-mode", default="label", choices=["label", "prob"],
-                   help="llama-guard only: 'label' = submitted verdict rule (raw 0.99/0.01/0.95/0.05/0.50); "
-                        "'prob' = raw score is P(unsafe) at the verdict token (label score kept in metadata)")
+                   help="llama-guard scorer only: label = verdict (default, submitted), prob = P(unsafe) "
+                        "(the RCDP Llama-Guard configuration)")
     m.add_argument("--device", default="cpu", help="scorer device")
     m.add_argument("--dtype", default=None, help="scorer dtype (default: as loaded; Llama-Guard: bf16 on GPU)")
     m.add_argument("--local-files-only", action="store_true")
@@ -570,7 +571,7 @@ def measure(args, scorer=None, tokenizer=None, alt_classifier=None, argv=None):
     if args.limit:
         examples = examples[: args.limit]
     raw_scorer = scorer or build_scorer(args.scorer, args.scorer_model_name, args.device, args.local_files_only,
-                                        args.dtype, score_mode=args.scorer_score_mode)
+                                        args.dtype, score_mode=getattr(args, "scorer_score_mode", "label"))
     clock = Clock(sync)
     timed_scorer = TimedScorer(raw_scorer, clock)
     replay = ReplayScorer()
@@ -837,9 +838,8 @@ def measure(args, scorer=None, tokenizer=None, alt_classifier=None, argv=None):
                 "scorer": {"kind": args.scorer,
                            "name": (Path(str(args.scorer_model_name)).name if args.scorer == "llama-guard"
                                     else args.scorer_model_name),
-                           "device": args.device, "dtype_arg": args.dtype,
-                           "score_mode_arg": (args.scorer_score_mode if args.scorer == "llama-guard" else None),
-                           "model": model_info(raw_scorer)},
+                           "device": args.device, "dtype_arg": args.dtype, "model": model_info(raw_scorer),
+                           "score_mode": getattr(args, "scorer_score_mode", "label")},
                 "protected": generator_settings(gen), "output_guard": judge_settings(guard),
                 "response_judge": judge_settings(judge),
                 "alt_guard": None if alt is None else {
