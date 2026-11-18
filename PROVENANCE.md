@@ -15,7 +15,7 @@ or summary outputs computed from the run files listed with them) or runs that di
 
 | tag | authored | content | result files reproduced |
 |---|---|---|---|
-| `submitted` | 2026-10-15 | submitted version (commit 22b72dd) | 0 |
+| `submitted` | 2026-10-15 | submitted version (commit ee8828e3) | 0 |
 | `r1-stage1` | 2026-11-13 22:33 | three-stage calibration protocol, single-turn runner | 7 |
 | `r1-stage2-1113` | 2026-11-14 00:07 | multi-turn, scorer baselines, cost harness | 12 |
 | `r1-stage2-1114a` | 2026-11-14 02:09 | Llama-Guard probability score mode | 9 |
@@ -24,6 +24,9 @@ or summary outputs computed from the run files listed with them) or runs that di
 | `r1-server-r5` | 2026-11-15 23:09 | hardened-service options for the Llama-Guard TAP runs, latency score mode | 8 |
 | `r1-server-r5-lgfix` | 2026-11-15 23:16 | Llama-Guard messages for account-bound histories | 4 |
 | `v1.1.0` | 2026-11-18 22:03 | per-caller policies (r5b), latency rerun of 2026-11-18; data preparation and reproduction scripts; this release | 27 |
+
+All commit hashes above match the tags of the remote repository; the release asset's `PROVENANCE.json` records the
+same code states by their full 40-character hashes.
 
 ## Experiments
 
